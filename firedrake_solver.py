@@ -1,18 +1,27 @@
 import firedrake as fd
 import ufl
-from zoomy_jax.fvm.solver_jax import Settings
-from attrs import field
+from zoomy_core.fvm.solver_numpy import Settings
+from attrs import field, define
 from zoomy_core.misc.misc import Zstruct
+from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 
 
+
+@define(frozen=True, slots=True, kw_only=True)
 class FiredrakeHyperbolicSolver:
-    def __init__(self, CFL=0.45, time_end=0.1):
-        settings: Zstruct = field(factory=lambda: Settings.default())
-        self.CFL = CFL
-        self.time_end = time_end
-        IdentityMatrix = field(
-            factory=lambda: ufl.as_tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        )
+    """Hyperbolic solver configuration for Firedrake."""
+
+    # Scalar parameters
+    CFL: float = field(default=0.45)
+    time_end: float = field(default=0.1)
+    
+    # Nested struct with factory
+    settings: Zstruct = field(factory=lambda: Settings.default())
+
+    # Tensor factory (recomputed for each instance)
+    IdentityMatrix = field(
+        factory=lambda: ufl.as_tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    )
 
     def __attrs_post_init__(self):
         defaults = Settings.default()
@@ -35,11 +44,13 @@ class FiredrakeHyperbolicSolver:
 
     def solve(self, mshfile, model):
         mesh = fd.Mesh(mshfile)
+        runtime_model = UFLRuntimeModel(model)
+
         x = fd.SpatialCoordinate(mesh)
         n = fd.FacetNormal(mesh)
 
-        V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=model.n_variables)
-        Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=model.n_aux_variables)
+        V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
+        Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
         Qn = fd.Function(V)
         Qnp1 = fd.Function(V)
         Qaux = fd.Function(Vaux)
@@ -55,12 +66,12 @@ class FiredrakeHyperbolicSolver:
             fd.dot(
                 test_q("+") - test_q("-"),
                 self.numerical_flux(
-                    model,
+                    runtime_model,
                     Qn("+"),
                     Qn("-"),
                     Qaux("+"),
                     Qaux("-"),
-                    model.parameters,
+                    runtime_model.parameters,
                     n("+"),
                     mesh,
                 ),
