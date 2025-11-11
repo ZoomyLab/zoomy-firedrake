@@ -1,4 +1,5 @@
 import firedrake as fd
+from firedrake.functionspaceimpl import MixedFunctionSpace
 import ufl
 from zoomy_core.fvm.solver_numpy import Settings
 from attrs import field, define
@@ -6,6 +7,17 @@ from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 import numpy as np
 from mpi4py import MPI
+
+from zoomy_core.misc.logger_config import logger
+import zoomy_core.misc.misc as misc
+
+import os
+
+import meshio
+
+
+
+
 
 
 
@@ -29,6 +41,32 @@ class FiredrakeHyperbolicSolver:
         defaults = Settings.default()
         defaults.update(self.settings)
         object.__setattr__(self, "settings", defaults)
+        
+    def get_map_boundary_tag_to_boundary_function_index(self, model, msh_path, mesh):
+        msh = meshio.read(msh_path)
+        boundary_function_names = model.boundary_conditions._boundary_tags
+        field_data_raw = msh.field_data  # name → [id, dim, type]
+        field_data = {
+            name: data for name, data in field_data_raw.items()
+            if name in boundary_function_names
+        }
+        extracted_facets_firedrake = mesh.exterior_facets.unique_markers
+        assert len(extracted_facets_firedrake) == len(field_data), f"Mismatch in number of boundary tags: extracted {extracted_facets_firedrake}, expected {field_data.keys()}"
+        
+        # 1. Make a list of (name, id)
+        name_id_pairs = [(name, data[0]) for name, data in field_data.items()]
+        
+        # 2. Sort alphabetically by name
+        name_id_pairs.sort(key=lambda x: x[0])
+        
+        # 3. Assign consecutive indices (1-based or 0-based as needed)
+        #    You mentioned "index of sorted list", so I'll use 1-based:
+        name_to_index = {name: i for i, (name, _) in enumerate(name_id_pairs)}
+        
+        # 4. Invert to get physical_id → index
+        physical_id_to_index = {pid: name_to_index[name] for name, pid in name_id_pairs}
+        
+        return physical_id_to_index
 
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
         return fd.dot(
@@ -57,36 +95,90 @@ class FiredrakeHyperbolicSolver:
             for i in range(n_dof_aux)
         ]
         out.write(*subfuns, time=time)
+
+
+
+    def get_function_coordinates(self, Q):
+        """
+        Return coordinates (as NumPy array) for each DoF in a Firedrake Function.
         
-    def compute_dt(self, model, Q, Qaux, ref_dx, CFL=0.45):
-        mesh = Q.function_space().mesh()
+        Works for DG/CG and arbitrary polynomial degree, assuming:
+            Q.function_space() == VectorFunctionSpace(mesh, family, degree, dim=n_variables)
         
-        V = fd.FunctionSpace(mesh, "DG", 0)
-        lam_x_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
-        lam_y_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
-        lam_x = fd.project(lam_x_expr, V)
-        lam_y = fd.project(lam_y_expr, V)
-        lam_max = max(np.max(lam_x.dat.data_ro), np.max(lam_y.dat.data_ro))
-        lam_max = mesh.comm.allreduce(lam_max, op=MPI.MAX)
-        return float(CFL * ref_dx / (lam_max + 1e-8))
+        Output shape: (num_dofs, geometric_dimension)
+        """
+        V = Q.function_space()
+        mesh = V.mesh()
+        element = V.ufl_element()
+
+        family = element.family()
+        degree = element.degree()
+        dim = mesh.geometric_dimension()
+
+        # Build coordinate field in the same FE family/degree
+        V_coords = fd.VectorFunctionSpace(mesh, family, degree)
+        x = fd.SpatialCoordinate(mesh)
+        coords_func = fd.Function(V_coords).interpolate(fd.as_vector(x))
+
+        # Return as NumPy array (read-only for safety)
+        coords = np.array(coords_func.dat.data_ro)
+        assert coords.shape[1] == dim, f"Unexpected coordinate shape {coords.shape}, dim={dim}"
+        return coords
+
+
+        
+    # def compute_dt(self, model, Q, Qaux, ref_dx, CFL=0.45):
+    #     mesh = Q.function_space().mesh()
+    #     V = fd.FunctionSpace(mesh, "DG", 0)
+    #     lam_x_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
+    #     lam_y_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
+    #     lam_x = fd.project(lam_x_expr, V)
+    #     lam_y = fd.project(lam_y_expr, V)
+    #     lam_max = max(np.max(lam_x.dat.data_ro), np.max(lam_y.dat.data_ro))
+    #     lam_max = mesh.comm.allreduce(lam_max, op=MPI.MAX)
+    #     return float(CFL * ref_dx / (lam_max + 1e-8))
+    
+    
+    def get_compute_dt(self, mesh, model, CFL=0.45):
+        """
+        Returns a callable that computes Δt(Q, Qaux) for a fixed mesh and model.
+
+        This avoids re-evaluating static mesh geometry (e.g. CellDiameter).
+        """
+
+        V0 = fd.FunctionSpace(mesh, "DG", 0)
+        h = fd.Function(V0).interpolate(fd.CellDiameter(mesh))
+        dim = mesh.geometric_dimension()
+
+        def compute_dt(Q, Qaux):
+            """Compute global stable Δt for the given fields Q and Qaux."""
+
+            # Compute eigenvalues in coordinate directions
+            lam_x_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
+            lam_y_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
+
+            lam_x = fd.project(lam_x_expr, V0)
+            lam_y = fd.project(lam_y_expr, V0)
+            lam_local = fd.Function(V0)
+            lam_local.dat.data[:] = np.maximum(lam_x.dat.data_ro, lam_y.dat.data_ro)
+
+            # Local stable dt
+            dt_local = fd.Function(V0).interpolate(CFL * (h/2) / (lam_local + 1e-8))
+
+            # Global min across cells and MPI ranks
+            dt_min = float(np.min(dt_local.dat.data_ro))
+            dt_min = mesh.comm.allreduce(dt_min, op=MPI.MIN)
+            return dt_min
+
+        return compute_dt
     
     def set_initial_condition(self, Q, model):
         mesh = Q.function_space().mesh()
         x = fd.SpatialCoordinate(mesh)
-        Q_init = model.initial_condition(fd.as_vector(x))
-        Q.interpolate(Q_init)
+        coords = self.get_function_coordinates(Q)
+        Qarr = Q.dat.data
+        Q.dat.data[:] = model.initial_conditions.apply(coords.T, Qarr.T).T
         
-    def initial_condition(self, V):
-        x, y = fd.SpatialCoordinate(V.mesh())
-        h0 = fd.conditional(x < 5, 2.0, 1.0)
-        u0 = 0.0
-        v0 = 0.0
-        b = 0.0
-        ic_expr = fd.as_vector([b, h0, h0*u0, h0*v0])
-        Q0 = fd.Function(V, name="Q")
-        Q0.interpolate(ic_expr)
-        return Q0
-
         
 
     def solve(self, mshfile, model):
@@ -94,6 +186,15 @@ class FiredrakeHyperbolicSolver:
         runtime_model = UFLRuntimeModel(model)
 
         x = fd.SpatialCoordinate(mesh)
+        dim = mesh.geometric_dimension()
+
+        # Always construct a 3D vector (fill missing components with 0)
+        if dim == 1:
+            x_3d = fd.as_vector([x[0], fd.Constant(0.0), fd.Constant(0.0)])
+        elif dim == 2:
+            x_3d = fd.as_vector([x[0], x[1], fd.Constant(0.0)])
+        else:
+            x_3d = fd.as_vector([x[0], x[1], x[2]])
         n = fd.FacetNormal(mesh)
 
         V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
@@ -102,37 +203,30 @@ class FiredrakeHyperbolicSolver:
         Qnp1 = fd.Function(V)
         Qaux = fd.Function(Vaux)
         
-        # self.set_initial_condition(Qn, model)
-        # self.set_initial_condition(Qnp1, model)
-        Qn = self.initial_condition(V)
-        Qnp1 = self.initial_condition(V)
+        self.set_initial_condition(Qn, model)
+        self.set_initial_condition(Qnp1, model)
         
-
-
-        t = 0.0
-        # dt = self.compute_dt(model, Qn, Qaux, ref_dx=mesh.cell_sizes.dat.data_ro.min(), CFL=self.CFL)
+        # Collect all boundary tags
+        map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
+        
+        
+        compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
+        sim_time = 0.0
         dt = fd.Constant(0.1)
 
         test_q = fd.TestFunction(V)
-        trial_q = fd.TrialFunction(V)
-        
-        # F =  dot(test_q, (trial_q - q_n)/dt) * dx
-        # F += dot(jump(test_q), numerical_flux(q_n('+'), q_n('-'), n('+'))) * dS
-        # F += dot(test_q, numerical_flux(q_n, q_ext, n)) * ds
-        # F -= dot(test_q, source(q_n, db_dx, db_dy)) * dx
-        
-        # ghost/extrapolation BC
-        q_ext = Qn
-        q_aux_ext = Qaux
+        # trial_q = fd.TrialFunction(V)
+              
+        Q = Qnp1
 
-        weak_form = fd.dot(test_q, (trial_q - Qn) / dt) * fd.dx
+        weak_form = fd.dot(test_q, (Qnp1-Qn) / dt) * fd.dx
         weak_form += (
             fd.dot(
                 test_q("+") - test_q("-"),
                 self.numerical_flux(
                     runtime_model,
-                    Qn("+"),
-                    Qn("-"),
+                    Q("+"),
+                    Q("-"),
                     Qaux("+"),
                     Qaux("-"),
                     runtime_model.parameters,
@@ -142,34 +236,76 @@ class FiredrakeHyperbolicSolver:
             )
             * fd.dS
         )
-        weak_form += fd.dot(test_q, self.numerical_flux(
-            runtime_model,
-            Qn,
-            q_ext,
-            Qaux,
-            q_aux_ext,
-            runtime_model.parameters, n, mesh)) * fd.ds
-        # weak_form -= fd.dot(
-        #     test_q,
-        #     runtime_model.source(Qn, Qaux, runtime_model.parameters),
-        # ) * fd.dx
 
-        a = fd.lhs(weak_form)
-        L = fd.rhs(weak_form)
-        problem = fd.LinearVariationalProblem(a, L, Qnp1)
-        solver = fd.LinearVariationalSolver(
-            problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
-        )
+        for tag, idx in map_boundary_tag_to_function_index.items():
+            
+            # Position and "distance" placeholders (can be replaced with actual geometric quantities)
+            dX = x[0]  # your placeholder (e.g., half cell size)
+
+            # Evaluate boundary state from model
+            Q_bnd = runtime_model.boundary_conditions(
+                idx,
+                sim_time,
+                x_3d,
+                dX,
+                Q,
+                Qaux,
+                runtime_model.parameters,
+                n,          
+            )
+            weak_form += ufl.dot(
+                test_q,
+                self.numerical_flux(runtime_model, Q, Q_bnd, Qaux, Qaux, runtime_model.parameters, n, mesh)
+            ) * fd.ds(tag)
         
-        out = fd.VTKFile("simulation.pvd")
-        self.write_state(Qnp1, Qaux, out, time=t)
-        dx_ref = mesh.cell_sizes.dat.data_ro.min()
+        source = runtime_model.source(Q, Qaux, runtime_model.parameters)
 
-        while t < self.time_end:
-            solver.solve()
+        if not isinstance(source, ufl.constantvalue.Zero):
+            weak_form -= fd.dot(
+                test_q,
+                source,
+            ) * fd.dx
+
+
+        # a = fd.lhs(weak_form)
+        # L = fd.rhs(weak_form)
+        # problem = fd.LinearVariationalProblem(a, L, Qnp1)
+        # solver = fd.LinearVariationalSolver(
+        #     problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
+        # )
+        
+        J = fd.derivative(weak_form, Qnp1)
+        problem = fd.NonlinearVariationalProblem(weak_form, Qnp1, J=J)
+        solver  = fd.NonlinearVariationalSolver(problem,
+                                                solver_parameters={
+                                                    "snes_type": "newtonls",
+                                                    "ksp_error_if_not_converged": True,
+                                                    "ksp_type": "gmres",
+                                                    "pc_type": "lu",
+                                                },
+                                                )
+        
+        main_dir = misc.get_main_directory()
+        out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
+        self.write_state(Qnp1, Qaux, out, time=sim_time)
+        dx_ref = mesh.cell_sizes.dat.data_ro.min()
+        iteration = 0
+        dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
+        next_write_time = dt_snapshot
+        
+        while sim_time < self.time_end:
             Qn.assign(Qnp1)
-            dt.assign(self.compute_dt(runtime_model, Qn, Qaux, ref_dx=dx_ref, CFL=self.CFL))
-            # t.assign(float(t) + float(dt))
-            t += float(dt)
-            self.write_state(Qnp1, Qaux, out, time=t)
-            print(f"t = {t:.3f}, dt = {float(dt):.3e}")
+            dt.assign(compute_dt(Qn, Qaux))
+            solver.solve()
+            sim_time += float(dt)
+            iteration += 1
+            if sim_time > next_write_time or sim_time >= self.time_end:
+                next_write_time += dt_snapshot
+                self.write_state(Qnp1, Qaux, out, time=sim_time)
+            if iteration % 10 == 0:
+                logger.info(
+                    f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
+                    f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
+                        )
+                
+        logger.info(f"Finished simulation with in {sim_time:.3f} seconds")
