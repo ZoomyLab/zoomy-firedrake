@@ -33,9 +33,7 @@ class FiredrakeHyperbolicSolver:
     settings: Zstruct = field(factory=lambda: Settings.default())
 
     # Tensor factory (recomputed for each instance)
-    IdentityMatrix = field(
-        factory=lambda: ufl.as_tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-    )
+    IdentityMatrix = field(factory=lambda: ufl.as_tensor([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]))
 
     def __attrs_post_init__(self):
         defaults = Settings.default()
@@ -68,12 +66,33 @@ class FiredrakeHyperbolicSolver:
         
         return physical_id_to_index
 
+    def get_nonconservative_flux(self, model, parameters, mesh):
+        samples, weights = np.polynomial.legendre.leggauss(3)
+        samples = fd.as_vector((samples+1)/2)
+        weights = fd.as_vector(weights*0.5)
+        def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
+            A = fd.dot(sum(wi * model.nonconservative_matrix(
+                    Ql + xi*(Qr - Ql),
+                    Qauxl + xi*(Qauxr - Qauxl),
+                    parameters
+                ) for xi, wi in zip(samples, weights)), n)
+            lam_l = self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh)
+            lam_r = self.max_abs_eigenvalue(model, Qr, Qauxr, n, mesh)
+            lam = ufl.max_value(lam_l, lam_r)
+            Id = self.IdentityMatrix
+            
+            Dp = 0.5 * fd.dot(A + lam * Id, (Qr - Ql))
+            Dm = 0.5 * fd.dot(A - lam * Id, (Qr - Ql))
+            return Dp, Dm
+        return nc_flux
+    
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
         return fd.dot(
             0.5
             * (model.flux(Ql, Qauxl, parameters) + model.flux(Qr, Qauxr, parameters)),
             n,
         ) - 0.5 * self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh) * (Qr - Ql)
+        
 
     def max_abs_eigenvalue(self, model, Q, Qaux, n, mesh):
         ev = model.eigenvalues(Q, Qaux, model.parameters, n)
@@ -95,6 +114,53 @@ class FiredrakeHyperbolicSolver:
             for i in range(n_dof_aux)
         ]
         out.write(*subfuns, time=time)
+        
+    def update_Qaux(self, Q, Qaux, eps=1e-8):
+        h = Q.sub(1)
+        eps = fd.Constant(1e-4)
+
+        h_new  = fd.max_value(h, 0.0)
+        h_inv = 1/(h_new + eps)
+        wet    = fd.conditional(h_new > eps, 1.0, 0.0)
+
+        # Build the whole updated Q vector
+        Qaux_new = fd.as_vector([
+            h_inv,            # whatever this component is
+        ])
+        Qaux.interpolate(Qaux_new)
+
+
+        
+    def update_Q(self, Q, Qaux):
+        pass
+        h = Q.sub(1)
+        eps = fd.Constant(1e-4)
+
+        h_new  = fd.max_value(h, 0.0)
+        wet    = fd.conditional(h_new > eps, 1.0, 0.0)
+        
+        
+        max_vel_cap = fd.Constant(100)
+        
+        u = Q.sub(2) / (h_new + eps)
+        u_new = wet * fd.sign(u) * fd.min_value(abs(u), max_vel_cap)
+        
+        v = Q.sub(3) / (h_new + eps)
+        v_new = wet * fd.sign(v) * fd.min_value(abs(v), max_vel_cap)
+        
+        
+        
+
+        # Build the whole updated Q vector
+        Q_new = fd.as_vector([
+            Q.sub(0),            # whatever this component is
+            h_new,               # updated h
+            h_new * u_new,      # zero momentum if dry
+            h_new * v_new,      # zero momentum if dry
+        ])
+        Q.interpolate(Q_new)
+
+        
 
 
 
@@ -125,20 +191,6 @@ class FiredrakeHyperbolicSolver:
         assert coords.shape[1] == dim, f"Unexpected coordinate shape {coords.shape}, dim={dim}"
         return coords
 
-
-        
-    # def compute_dt(self, model, Q, Qaux, ref_dx, CFL=0.45):
-    #     mesh = Q.function_space().mesh()
-    #     V = fd.FunctionSpace(mesh, "DG", 0)
-    #     lam_x_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
-    #     lam_y_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
-    #     lam_x = fd.project(lam_x_expr, V)
-    #     lam_y = fd.project(lam_y_expr, V)
-    #     lam_max = max(np.max(lam_x.dat.data_ro), np.max(lam_y.dat.data_ro))
-    #     lam_max = mesh.comm.allreduce(lam_max, op=MPI.MAX)
-    #     return float(CFL * ref_dx / (lam_max + 1e-8))
-    
-    
     def get_compute_dt(self, mesh, model, CFL=0.45):
         """
         Returns a callable that computes Δt(Q, Qaux) for a fixed mesh and model.
@@ -179,6 +231,22 @@ class FiredrakeHyperbolicSolver:
         Qarr = Q.dat.data
         Q.dat.data[:] = model.initial_conditions.apply(coords.T, Qarr.T).T
         
+    def solve_with_callback(self, problem, Qnp1, Qaux, update_fn, solver_parameters=None):
+        solver = fd.NonlinearVariationalSolver(problem, solver_parameters=solver_parameters or {})
+
+        # Access the underlying SNES object
+        snes = solver.snes
+
+        # Define callback
+        def update_callback(snes, it, rnorm):
+            update_fn(Qnp1, Qaux)
+
+        # Attach it
+        snes.setMonitor(update_callback)
+
+        # Solve
+        solver.solve()
+        
         
 
     def solve(self, mshfile, model):
@@ -205,21 +273,31 @@ class FiredrakeHyperbolicSolver:
         
         self.set_initial_condition(Qn, model)
         self.set_initial_condition(Qnp1, model)
+        self.update_Qaux(Qn, Qaux)
+        self.update_Qaux(Qnp1, Qaux)
+        self.update_Q(Qn, Qaux)
+        self.update_Q(Qnp1, Qaux)
         
         # Collect all boundary tags
         map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
         
         
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
+        nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
         test_q = fd.TestFunction(V)
-        # trial_q = fd.TrialFunction(V)
+        trial_q = fd.TrialFunction(V)
               
-        Q = Qnp1
+        Q = Qn
 
+        # linear problem
+        # weak_form = fd.dot(test_q, (trial_q-Qn) / dt) * fd.dx      
+        # nonlinear version
         weak_form = fd.dot(test_q, (Qnp1-Qn) / dt) * fd.dx
+
+        
         weak_form += (
             fd.dot(
                 test_q("+") - test_q("-"),
@@ -236,6 +314,22 @@ class FiredrakeHyperbolicSolver:
             )
             * fd.dS
         )
+        
+
+        Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux("-"), Qaux("+"), n("-"))
+        weak_form += 0.5*(
+            fd.dot(
+                test_q("+"),
+                Dp
+                )
+            ) * fd.dS
+        weak_form += 0.5*(
+            fd.dot(
+                test_q("-"),
+                Dm
+                )
+            ) * fd.dS
+        
 
         for tag, idx in map_boundary_tag_to_function_index.items():
             
@@ -257,15 +351,23 @@ class FiredrakeHyperbolicSolver:
                 test_q,
                 self.numerical_flux(runtime_model, Q, Q_bnd, Qaux, Qaux, runtime_model.parameters, n, mesh)
             ) * fd.ds(tag)
+            
+            Dp, Dm = nc_flux(Q, Q_bnd, Qaux, Qaux, n)
+            weak_form += (
+                fd.dot(
+                    test_q,
+                    Dm
+                    )
+                ) * fd.ds(tag)
+
         
-        source = runtime_model.source(Q, Qaux, runtime_model.parameters)
-
-        if not isinstance(source, ufl.constantvalue.Zero):
-            weak_form -= fd.dot(
-                test_q,
-                source,
-            ) * fd.dx
-
+        # source = runtime_model.source(Qn, Qaux, runtime_model.parameters)
+        # if not isinstance(source, ufl.constantvalue.Zero):
+        #     weak_form -= fd.dot(
+        #         test_q,
+        #         source,
+        #     ) * fd.dx
+            
 
         # a = fd.lhs(weak_form)
         # L = fd.rhs(weak_form)
@@ -282,8 +384,27 @@ class FiredrakeHyperbolicSolver:
                                                     "ksp_error_if_not_converged": True,
                                                     "ksp_type": "gmres",
                                                     "pc_type": "lu",
+                                                    # "snes_type": "newtonls",
+                                                    # "snes_linesearch_type": "bt",
+                                                    # "snes_linesearch_damping": 0.8,
+                                                    # "snes_max_it": 25,
+                                                    # "snes_rtol": 1e-8,
+                                                    # "snes_atol": 1e-10,
+                                                    # "snes_stol": 1e-12,
+                                                    # "ksp_type": "bcgs",
+                                                    # "pc_type": "jacobi",
                                                 },
                                                 )
+        
+        # Access PETSc SNES
+        snes = solver.snes
+
+        def callback(snes, it, rnorm):
+            # This is called each nonlinear iteration
+            self.update_Q(Qnp1, Qaux)
+            self.update_Qaux(Qnp1, Qaux)
+
+        snes.setMonitor(callback)
         
         main_dir = misc.get_main_directory()
         out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
@@ -293,10 +414,14 @@ class FiredrakeHyperbolicSolver:
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
         next_write_time = dt_snapshot
         
+        
         while sim_time < self.time_end:
             Qn.assign(Qnp1)
+            self.update_Q(Qn, Qaux)
+            self.update_Qaux(Qn, Qaux)
             dt.assign(compute_dt(Qn, Qaux))
             solver.solve()
+            self.update_Q(Qnp1, Qaux)
             sim_time += float(dt)
             iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
