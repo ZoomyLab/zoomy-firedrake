@@ -86,19 +86,101 @@ class FiredrakeHyperbolicSolver:
             return Dp, Dm
         return nc_flux
     
+    def hydrostatic_reconstruction(self, Ql, Qr):
+        """
+        Hydrostatic reconstruction for shallow water in Firedrake/UFL.
+        State layout: Q[0] = b, Q[1] = h, Q[2] = hu (if present), others untouched.
+        """
+        bL, hL = Ql[0], Ql[1]
+        bR, hR = Qr[0], Qr[1]
+
+        # Free surface
+        etaL = hL + bL
+        etaR = hR + bR
+
+        # max(b_L, b_R) in UFL
+        b_star = ufl.max_value(bL, bR)
+        
+        eps = fd.Constant(1e-4)
+
+
+        # Reconstructed depths (>= 0)
+        hL_star = ufl.max_value(0.0, etaL - b_star)
+        hR_star = ufl.max_value(0.0, etaR - b_star)
+
+        # Number of components in Q
+        ncomp = Ql.ufl_shape[0]
+
+        # Build component lists manually (no slicing)
+        compsL = [None] * ncomp
+        compsR = [None] * ncomp
+
+        # b stays the same
+        compsL[0] = bL
+        compsR[0] = bR
+
+        # h replaced by reconstructed depths
+        compsL[1] = hL_star
+        compsR[1] = hR_star
+        
+
+
+        if ncomp > 2:
+            # Assume Q[2] is hu; we want hu* = h* u
+            hL_eff = ufl.max_value(hL, eps)  # regularized division
+            hR_eff = ufl.max_value(hR, eps)
+
+            uL = Ql[2] / hL_eff
+            uR = Qr[2] / hR_eff
+
+            compsL[2] = hL_star * uL
+            compsR[2] = hR_star * uR
+
+            # Any extra components: just copy over unchanged
+            for i in range(3, ncomp):
+                compsL[i] = Ql[i]
+                compsR[i] = Qr[i]
+
+        # If ncomp == 2, we’re done; the remaining entries are already None but unused.
+
+        Ql_star = ufl.as_vector(compsL)
+        Qr_star = ufl.as_vector(compsR)
+
+        return Ql_star, Qr_star
+    
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
-        return fd.dot(
-            0.5
-            * (model.flux(Ql, Qauxl, parameters) + model.flux(Qr, Qauxr, parameters)),
-            n,
-        ) - 0.5 * self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh) * (Qr - Ql)
+        # Hydrostatic reconstruction
+        Ql_star, Qr_star = self.hydrostatic_reconstruction(Ql, Qr)
+
+        # Fluxes from reconstructed states
+        flux_L = model.flux(Ql_star, Qauxl, parameters)
+        flux_R = model.flux(Qr_star, Qauxr, parameters)
+
+        central_flux = 0.5 * (flux_L + flux_R)
+
+        # Wave speed (can still use original states for a robust bound)
+        alpha_L = self.max_abs_eigenvalue(model, Ql_star, Qauxl, n, mesh)
+        alpha_R = self.max_abs_eigenvalue(model, Qr_star, Qauxr, n, mesh)
+
+
+        # LLF-type dissipation using reconstructed states
+        num_flux = fd.dot(central_flux, n) - 0.5 * ufl.max_value(alpha_L, alpha_R) * (Qr_star - Ql_star)
+
+        return num_flux
+    
+    # def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
+    #     return fd.dot(
+    #         0.5
+    #         * (model.flux(Ql, Qauxl, parameters) + model.flux(Qr, Qauxr, parameters)),
+    #         n,
+    #     ) - 0.5 * self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh) * (Qr - Ql)
         
 
     def max_abs_eigenvalue(self, model, Q, Qaux, n, mesh):
         ev = model.eigenvalues(Q, Qaux, model.parameters, n)
         max_ev = abs(ev[0])
         for i in range(1, model.n_variables):
-            max_ev = ufl.conditional(ev[i] > max_ev, ev[i], max_ev)
+            max_ev = ufl.conditional(abs(ev[i]) > max_ev, abs(ev[i]), max_ev)
         return max_ev
     
     def write_state(self, q, qaux, out, time=0.0, names=None):
@@ -119,9 +201,9 @@ class FiredrakeHyperbolicSolver:
         h = Q.sub(1)
         eps = fd.Constant(1e-4)
 
-        h_new  = fd.max_value(h, 0.0)
-        h_inv = 1/(h_new + eps)
-        wet    = fd.conditional(h_new > eps, 1.0, 0.0)
+        h_new  = fd.max_value(h, eps)
+        h_inv = 1/(h_new)
+        wet    = fd.conditional(h > eps, 1.0, 0.0)
 
         # Build the whole updated Q vector
         Qaux_new = fd.as_vector([
@@ -132,20 +214,19 @@ class FiredrakeHyperbolicSolver:
 
         
     def update_Q(self, Q, Qaux):
-        pass
         h = Q.sub(1)
         eps = fd.Constant(1e-4)
 
-        h_new  = fd.max_value(h, 0.0)
-        wet    = fd.conditional(h_new > eps, 1.0, 0.0)
+        h_new  = fd.max_value(h, eps)
+        wet    = fd.conditional(h > eps, 1.0, 0.0)
         
         
         max_vel_cap = fd.Constant(100)
         
-        u = Q.sub(2) / (h_new + eps)
+        u = Q.sub(2) / (h_new)
         u_new = wet * fd.sign(u) * fd.min_value(abs(u), max_vel_cap)
         
-        v = Q.sub(3) / (h_new + eps)
+        v = Q.sub(3) / (h_new)
         v_new = wet * fd.sign(v) * fd.min_value(abs(v), max_vel_cap)
         
         
@@ -154,11 +235,12 @@ class FiredrakeHyperbolicSolver:
         # Build the whole updated Q vector
         Q_new = fd.as_vector([
             Q.sub(0),            # whatever this component is
-            h_new,               # updated h
+            Q.sub(1),               # updated h
             h_new * u_new,      # zero momentum if dry
             h_new * v_new,      # zero momentum if dry
         ])
         Q.interpolate(Q_new)
+
 
         
 
@@ -361,19 +443,21 @@ class FiredrakeHyperbolicSolver:
                 ) * fd.ds(tag)
 
         
-        # source = runtime_model.source(Qn, Qaux, runtime_model.parameters)
-        # if not isinstance(source, ufl.constantvalue.Zero):
-        #     weak_form -= fd.dot(
-        #         test_q,
-        #         source,
-        #     ) * fd.dx
+        source = runtime_model.source(Qn, Qaux, runtime_model.parameters)
+        if not isinstance(source, ufl.constantvalue.Zero):
+            weak_form -= fd.dot(
+                test_q,
+                source,
+            ) * fd.dx
             
 
         # a = fd.lhs(weak_form)
         # L = fd.rhs(weak_form)
         # problem = fd.LinearVariationalProblem(a, L, Qnp1)
         # solver = fd.LinearVariationalSolver(
-        #     problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
+        #     # problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
+        #     problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "lu"}
+
         # )
         
         J = fd.derivative(weak_form, Qnp1)
