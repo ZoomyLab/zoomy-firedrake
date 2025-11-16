@@ -164,7 +164,7 @@ class FiredrakeHyperbolicSolver:
 
 
         # LLF-type dissipation using reconstructed states
-        num_flux = fd.dot(central_flux, n) - 0.5 * ufl.max_value(alpha_L, alpha_R) * (Qr_star - Ql_star)
+        num_flux = fd.dot(central_flux, n) - 0.5 * ufl.max_value(alpha_L, alpha_R) * fd.dot(self.IdentityMatrix, (Qr_star - Ql_star))
 
         return num_flux
     
@@ -443,7 +443,7 @@ class FiredrakeHyperbolicSolver:
                 ) * fd.ds(tag)
 
         
-        source = runtime_model.source(Qn, Qaux, runtime_model.parameters)
+        source = runtime_model.source(Qnp1, Qaux, runtime_model.parameters)
         if not isinstance(source, ufl.constantvalue.Zero):
             weak_form -= fd.dot(
                 test_q,
