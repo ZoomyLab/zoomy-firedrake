@@ -329,12 +329,7 @@ class FiredrakeHyperbolicSolver:
         # Solve
         solver.solve()
         
-        
-
-    def solve(self, mshfile, model):
-        mesh = fd.Mesh(mshfile)
-        runtime_model = UFLRuntimeModel(model)
-
+    def _get_x_and_n(self, mesh):
         x = fd.SpatialCoordinate(mesh)
         dim = mesh.geometric_dimension()
 
@@ -346,6 +341,12 @@ class FiredrakeHyperbolicSolver:
         else:
             x_3d = fd.as_vector([x[0], x[1], x[2]])
         n = fd.FacetNormal(mesh)
+        return x, x_3d, n
+    
+    def _setup(self, mshfile, model):
+        mesh = fd.Mesh(mshfile)
+        runtime_model = UFLRuntimeModel(model)
+
 
         V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
         Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
@@ -363,14 +364,11 @@ class FiredrakeHyperbolicSolver:
         # Collect all boundary tags
         map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
         
-        
-        compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
-        nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
-        sim_time = 0.0
-        dt = fd.Constant(0.1)
-
-        test_q = fd.TestFunction(V)
-        trial_q = fd.TrialFunction(V)
+        return mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index 
+    
+    def _get_weak_form(self, runtime_model, Qn, Qnp1, Qaux, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
+        test_q = fd.TestFunction(Qn.function_space())
+        trial_q = fd.TrialFunction(Qn.function_space())
               
         Q = Qn
 
@@ -398,6 +396,7 @@ class FiredrakeHyperbolicSolver:
         )
         
 
+        nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux("-"), Qaux("+"), n("-"))
         weak_form += 0.5*(
             fd.dot(
@@ -450,8 +449,10 @@ class FiredrakeHyperbolicSolver:
                 source,
             ) * fd.dx
             
-
-        # a = fd.lhs(weak_form)
+        return weak_form
+    
+    def _get_solver(self, weak_form, Qnp1, Qaux):
+         # a = fd.lhs(weak_form)
         # L = fd.rhs(weak_form)
         # problem = fd.LinearVariationalProblem(a, L, Qnp1)
         # solver = fd.LinearVariationalSolver(
@@ -489,6 +490,21 @@ class FiredrakeHyperbolicSolver:
             self.update_Qaux(Qnp1, Qaux)
 
         snes.setMonitor(callback)
+        return solver
+
+    def solve(self, mshfile, model):
+        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index = self._setup(mshfile, model)
+        x, x_3d, n = self._get_x_and_n(mesh)
+        
+        compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
+        nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
+        sim_time = 0.0
+        dt = fd.Constant(0.1)
+
+        weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+            
+
+        solver = self._get_solver(weak_form, Qnp1, Qaux)
         
         main_dir = misc.get_main_directory()
         out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
@@ -507,7 +523,6 @@ class FiredrakeHyperbolicSolver:
             solver.solve()
             self.update_Q(Qnp1, Qaux)
             sim_time += float(dt)
-            iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
                 next_write_time += dt_snapshot
                 self.write_state(Qnp1, Qaux, out, time=sim_time)
