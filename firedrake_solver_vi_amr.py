@@ -100,7 +100,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         # Write mesh + scalar fields to output
         out.write(mesh_coords, *subfuns, time=time)
 
-        return [mesh_coords] + subfuns  # Return the components written (optional)
 
 
     def solve(self, mshfile, model):
@@ -140,10 +139,12 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
             sim_time += float(dt)
             iteration += 1
 
-            # Write output
-            if sim_time > next_write_time or sim_time >= self.time_end:
-                next_write_time += dt_snapshot
-                self.write_state(Qnp1, Qaux, out, time=sim_time)
+            self.write_state(Qnp1, Qaux, out, time=sim_time)
+
+            # # Write output
+            # if sim_time > next_write_time or sim_time >= self.time_end:
+            #     next_write_time += dt_snapshot
+            #     self.write_state(Qnp1, Qaux, out, time=sim_time)
 
                 
             if iteration % 10 == 0:
