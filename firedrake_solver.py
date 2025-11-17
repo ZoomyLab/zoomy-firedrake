@@ -253,7 +253,7 @@ class FiredrakeHyperbolicSolver:
         Works for DG/CG and arbitrary polynomial degree, assuming:
             Q.function_space() == VectorFunctionSpace(mesh, family, degree, dim=n_variables)
         
-        Output shape: (num_dofs, geometric_dimension)
+        Output shape: (num_dofs, geometric_dimension())
         """
         V = Q.function_space()
         mesh = V.mesh()
@@ -523,6 +523,7 @@ class FiredrakeHyperbolicSolver:
             solver.solve()
             self.update_Q(Qnp1, Qaux)
             sim_time += float(dt)
+            iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
                 next_write_time += dt_snapshot
                 self.write_state(Qnp1, Qaux, out, time=sim_time)
