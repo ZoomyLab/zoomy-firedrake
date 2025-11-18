@@ -1,148 +1,298 @@
+import os
+import traceback
+
 import firedrake as fd
 from firedrake.functionspaceimpl import MixedFunctionSpace
 import ufl
-from zoomy_core.fvm.solver_numpy import Settings
-from attrs import field, define
-from zoomy_core.misc.misc import Zstruct
-from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 import numpy as np
 from mpi4py import MPI
 
+from attrs import field, define
+
+from zoomy_core.fvm.solver_numpy import Settings
+from zoomy_core.misc.misc import Zstruct
+from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 from zoomy_core.misc.logger_config import logger
 import zoomy_core.misc.misc as misc
 import zoomy_firedrake.firedrake_solver as fd_solver
 
+from pyop2 import op2
+
 from animate.utility import VTKFile
-
-import os
-import meshio
-import traceback
-
-# Import animate for AMR
+from animate.metric import RiemannianMetric, P0Metric
 from animate.adapt import adapt
-from animate.metric import P0Metric
+
+from firedrake.projection import Projector
+from firedrake.petsc import PETSc
+
+
+# Optional: inspect adaptor options (mostly for debugging)
+opts = PETSc.Options()
+print("Available options containing 'adaptor':")
+for k in opts.getAll().keys():
+    if b"adaptor" in k:
+        print(k.decode())
+
+
+# ---------------------------------------------------------------------------
+# Helper: grow a DG0 indicator by a given number of cell layers
+# ---------------------------------------------------------------------------
+
+def grow_indicator(ind_dg0: fd.Function, width: int = 1) -> fd.Function:
+    """
+    Return a new DG-0 Function in which the set {value==1} has been
+    dilated by exactly 'width' cell layers.
+
+    Strategy: vertex averaging (DG0 → CG1) followed by thresholding.
+    A cell is added *only* if tmp_dg > 0.49 (all vertices already touched).
+    """
+    V0 = ind_dg0.function_space()
+    mesh = V0.mesh()
+    Vcg = fd.FunctionSpace(mesh, "CG", 1)
+
+    grown = fd.Function(V0, name="grown_indicator")
+    grown.assign(ind_dg0)
+
+    for _ in range(width):
+        tmp_cg = fd.project(grown, Vcg)   # DG0 → CG1
+        tmp_dg = fd.project(tmp_cg, V0)   # CG1 → DG0
+        grown.interpolate(fd.conditional(tmp_dg > 0.49, 1.0, grown))
+    return grown
 
 
 @define(frozen=True, slots=True, kw_only=True)
 class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     refine_every: int = field(default=20)      # time steps between refinements
     max_refinements: int = field(default=6)    # total refinement steps
-    
-    def build_spd_metric_from_indicator(self, metric, indicator, safety=1e-3):
-        """Build a safe SPD metric where indicator is 0 or 1."""
-        ndim = metric.ufl_shape[-1]  # 2 in 2D, 3 in 3D
-        ncells = len(indicator)
 
-        # Initialize as isotropic metric
-        values = np.zeros((ncells, ndim, ndim))
+    # ------------------------------------------------------------------
+    # Metric helpers based on RiemannianMetric
+    # ------------------------------------------------------------------
 
-        # At minimum: identity scaled by safety factor
-        values[:] = np.eye(ndim) * safety
-
-        # Mark refinement regions (indicator == 1) with stronger metric
-        refining = indicator > 0.5
-        values[refining, :, :] = np.eye(ndim)  # Could increase entries for stronger refinement
-
-        # Assign into metric object
-        metric.dat.data[:] = values
-    
-    def _marker_simple_slope(self, Q, threshold=0.05):
+    def _normalize_metric(self, metric: RiemannianMetric, mesh, target_factor=1.0, p=np.inf):
         """
-        Basic refinement marker based on magnitude of grad(h) squared,
-        using interpolation and avoiding project() to prevent integration domain errors.
+        Use Animate's RiemannianMetric.normalise() to scale the metric
+        to a desired complexity: target_factor × (#cells).
+        """
+        target_complexity = float(target_factor * mesh.num_cells())
+        params = metric.metric_parameters.copy()
+        params["dm_plex_metric_target_complexity"] = target_complexity
+        params["dm_plex_metric_p"] = p
+        metric.set_parameters(params)
+        metric.normalise()
+        return metric
+
+    def _metric_wet_dry_smooth(self, Q, h_dry=1.0e-4, width=3, gamma=20.0):
+        """
+        Wet–dry metric using RiemannianMetric:
+
+        - Start from DG0 indicator (wet = 1, dry = 0)
+        - Grow by 'width' layers
+        - Lift to CG1 and scale
+        - Build isotropic RiemannianMetric via compute_isotropic_metric
         """
         mesh = Q.function_space().mesh()
+        V0 = fd.FunctionSpace(mesh, "DG", 0)
+        V1 = fd.FunctionSpace(mesh, "CG", 1)
 
-        # h is in DG0 (component 1 of Q)
         h = Q.sub(1)
 
-        # Reconstruct h in CG1 so grad(h) is nonzero and well-resolved
-        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
-        h_cg1 = fd.Function(Vcg1)
-        h_cg1.interpolate(h)
+        # DG0 wet indicator
+        indicator = fd.Function(V0, name="wet_indicator")
+        indicator.interpolate(fd.conditional(h > h_dry, 1.0, 0.0))
 
-        # Compute grad(h) in CG1 and interpolate its squared norm into DG0
-        grad_h_sq = fd.inner(fd.grad(h_cg1), fd.grad(h_cg1))
-        Vdg0 = fd.FunctionSpace(mesh, "DG", 0)
-        grad_norm_sq = fd.Function(Vdg0)
-        grad_norm_sq.interpolate(grad_h_sq)  # interpolate into DG0
+        # Grow by 'width' layers
+        indicator = grow_indicator(indicator, width)
 
-        # Create marker: 1 if |grad(h)| > threshold, 0 otherwise
-        marker = fd.Function(Vdg0)
-        marker.interpolate(fd.conditional(grad_norm_sq > threshold**2, 1.0, 0.0))
+        # Lift to CG1
+        smooth_indicator = fd.Function(V1, name="smooth_indicator")
+        smooth_indicator.interpolate(indicator)
 
-        return marker
+        # Build isotropic Riemannian metric
+        metric = RiemannianMetric(mesh, name="wet_dry_metric")
+        # 1 + gamma * indicator ∈ [1, 1+gamma]
+        scaled = fd.Function(V1)
+        scaled.interpolate(1.0 + gamma * smooth_indicator)
+        metric.compute_isotropic_metric(scaled, interpolant="L2")
 
+        # Enforce SPD + size / anisotropy bounds
+        metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
 
+        return metric, smooth_indicator
 
-    def _marker_from_grad_h(self, Q, threshold=0.05):
+    def _metric_bathymetry(self, Q, grad_thres=0.05, L_ref=0.3, L_bkg=1.5, L0=1.0):
         """
-        AMR marker based on ||grad(h)||, where h = Q[1].
+        Bathymetry-based refinement metric:
 
-        Steps:
-        - Take h (in DG0)
-        - Interpolate to CG1
-        - Compute grad(h_cg1)
-        - Build indicator and threshold to create DG0 0/1 marker
+        - Detect large |grad b|
+        - Build indicator
+        - Turn into isotropic RiemannianMetric with a length scale
+          transition L_bkg -> L_ref in regions of high gradient.
         """
         mesh = Q.function_space().mesh()
+        b = Q.sub(0)
 
-        # h is in DG0 (component 1 of Q)
-        h_dg0 = Q.sub(1)
-
-        # Reconstruct h in CG1 so grad(h) is nonzero and well-resolved
+        # CG1 bathymetry
         Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
-        h_cg1 = fd.Function(Vcg1, name="h_cg1")
-        h_cg1.interpolate(h_dg0)
+        b_cg = fd.interpolate(b, Vcg1)
 
-        # Compute the norm of grad(h)
-        grad_h_norm_expr = fd.sqrt(fd.inner(fd.grad(h_cg1), fd.grad(h_cg1)))
+        gnorm = fd.Function(Vcg1)
+        gnorm.interpolate(fd.sqrt(fd.inner(fd.grad(b_cg), fd.grad(b_cg))))
 
-        # Indicator in CG1
-        indicator = fd.Function(Vcg1, name="grad_h_norm")
-        indicator.interpolate(grad_h_norm_expr)
+        V0 = fd.FunctionSpace(mesh, "DG", 0)
+        ind = fd.Function(V0)
+        ind.interpolate(fd.conditional(gnorm > grad_thres, 1.0, 0.0))
 
-        # Threshold and put into DG0 for marking
-        Vdg0 = fd.FunctionSpace(mesh, "DG", 0)
-        marker = fd.Function(Vdg0, name="amr_marker")
-        marker.interpolate(fd.conditional(indicator > threshold, 1.0, 0.0))
+        # Use a smooth CG1 indicator
+        ind_cg = fd.Function(Vcg1)
+        ind_cg.interpolate(ind)
 
-        return marker
-    
-    def _prolong_vector_function(self, old_fun, new_space):
+        # Scale lengths by L0
+        L_ref *= L0
+        L_bkg *= L0
+
+        # L field: smaller where ind ~ 1 (refinement)
+        L = fd.Function(Vcg1)
+        L.interpolate(L_bkg - ind_cg * (L_bkg - L_ref))
+
+        # Metric weight ~ 1 / L^2
+        weight = fd.Function(Vcg1)
+        eps = 1.0e-6
+        weight.interpolate(1.0 / (L * L + eps))
+
+        metric = RiemannianMetric(mesh, name="bathymetry_metric")
+        metric.compute_isotropic_metric(weight, interpolant="L2")
+        metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
+        return metric
+
+    def _metric_wave(self, Q,
+                     L_stream=0.5,     # multiples of L0
+                     L_cross=1.6,
+                     vel_floor=1e-8,
+                     L0=1.0):
+        """
+        Flow-aligned anisotropic metric:
+
+        - Compute velocity (u, v)
+        - Build a P0Metric per cell with eigenvectors aligned to flow
+        - Project to CG1 RiemannianMetric
+        """
+        L_stream *= L0
+        L_cross *= L0
+
+        mesh = Q.function_space().mesh()
+        h, hu, hv = Q.sub(1), Q.sub(2), Q.sub(3)
+
+        V0 = h.function_space()
+        u = fd.Function(V0)
+        v = fd.Function(V0)
+
+        u.interpolate(fd.conditional(h > vel_floor, hu / h, 0.0))
+        v.interpolate(fd.conditional(h > vel_floor, hv / h, 0.0))
+
+        u_arr = u.dat.data_ro
+        v_arr = v.dat.data_ro
+        speed = np.sqrt(u_arr**2 + v_arr**2)
+
+        # global max speed (MPI-safe)
+        max_speed = mesh.comm.allreduce(float(speed.max()), op=MPI.MAX)
+        max_speed = max(max_speed, vel_floor)
+
+        # Build DG0 tensor metric first (P0Metric)
+        Vten0 = fd.TensorFunctionSpace(mesh, "DG", 0, shape=(2, 2))
+        M_p0 = P0Metric(Vten0)
+        data = M_p0.dat.data
+        I2 = np.eye(2)
+
+        lam_cross = 1.0 / L_cross**2
+        for c in range(mesh.num_cells()):
+            s = speed[c] / max_speed    # 0…1
+            if s < 0.05:                # almost stagnant
+                data[c, :, :] = I2 * lam_cross
+                continue
+            nx, ny = u_arr[c] / speed[c], v_arr[c] / speed[c]
+            vdir = np.array([nx, ny])
+            tdir = np.array([-ny, nx])
+            lam_stream = 1.0 / (L_stream * (1 - 0.8 * s))**2
+            data[c, :, :] = (
+                lam_stream * np.outer(vdir, vdir)
+                + lam_cross * np.outer(tdir, tdir)
+            )
+
+        # Project to CG1 Riemannian metric
+        metric = RiemannianMetric(mesh, name="wave_metric")
+        metric.project(M_p0)
+        metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
+        return metric
+
+    def _combine_metrics(self, metrics, weights=None, average=True):
+        """
+        Combine several RiemannianMetrics using Animate's combine/average machinery.
+
+        metrics  – list[RiemannianMetric]
+        weights  – optional list of floats; len = nmetrics
+        """
+        assert len(metrics) > 0
+        base = metrics[0].copy(deepcopy=True)
+        others = metrics[1:]
+        if not others:
+            return base
+        if average:
+            if weights is None:
+                return base.average(*others)
+            else:
+                if len(weights) != len(metrics):
+                    raise ValueError(
+                        f"weights has length {len(weights)}, but metrics has {len(metrics)}"
+                    )
+                return base.average(*others, weights=weights)
+        else:
+            # Intersection
+            return base.intersect(*others)
+
+    # ------------------------------------------------------------------
+    # Prolongation: conservative + positivity preserving
+    # ------------------------------------------------------------------
+
+    def _prolong_vector_function(self, old_fun, new_space,
+                                 h_dry=1e-10, pos_idx=[1], clip=True):
+        """
+        Conservatively prolong vector field old_fun into new_space
+        while enforcing positivity (e.g., for water height).
+        """
         new_fun = fd.Function(new_space)
-        new_fun.interpolate(old_fun)
+
+        for i in range(old_fun.function_space().value_size):
+            comp_old = old_fun.sub(i)
+            V_old_scalar = comp_old.function_space()
+            tmp_old = fd.Function(V_old_scalar)
+            tmp_old.assign(comp_old)
+
+            comp_new = new_fun.sub(i)
+
+            projector = Projector(tmp_old, comp_new)
+            projector.project()
+
+            # Enforce positivity for specific components
+            if clip and i in pos_idx:
+                comp_new.dat.data[:] = np.maximum(comp_new.dat.data_ro, h_dry)
+
         return new_fun
 
-    # def _prolong_vector_function(self, old_fun, new_V):
-    #     """
-    #     Prolong a vector Function old_fun onto new mesh / space new_V
-    #     by interpolating each component separately.
+    # ------------------------------------------------------------------
+    # Output helpers
+    # ------------------------------------------------------------------
 
-    #     old_fun: Function on old mesh, vector-valued.
-    #     new_V:   VectorFunctionSpace on new mesh with same value_size.
-    #     """
-    #     nvar = old_fun.function_space().value_size
-    #     assert new_V.value_size == nvar
-
-    #     new_fun = fd.Function(new_V, name=old_fun.name())
-
-    #     for i in range(nvar):
-    #         new_fun.sub(i).interpolate(old_fun.sub(i))
-
-    #     return new_fun
-    
     def write_state(self, q, qaux, vtk_file, time=0.0, names=None):
         """
-        Write state variables q, qaux and mesh to a VTK adaptive file.
-        Each call writes a full snapshot at a given time step.
+        Write state variables q, qaux to a VTK adaptive file.
+        Each call writes a full snapshot at a given time.
         """
         mesh = q.function_space().mesh()
         V_scalar = fd.FunctionSpace(mesh, "DG", 0)
         n_q = q.function_space().value_size
         n_aux = qaux.function_space().value_size
 
-        # Project components of q and qaux to scalar DG0 functions
         fields = [
             fd.project(q[i], V_scalar, name=names[i] if names else f"Q{i}")
             for i in range(n_q)
@@ -151,50 +301,97 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
             for i in range(n_aux)
         ]
 
-        # Write fields (mesh automatically inferred from first function)
         vtk_file.write(*fields, time=time)
         print(f"[VTK] Exported timestep {time:.4f} with {mesh.num_cells()} cells.")
 
-    # def write_state(self, q, qaux, out, time=0.0, names=None):
-    #     mesh = q.function_space().mesh()
-    #     V_scalar = fd.FunctionSpace(mesh, "DG", 0)
-    #     n_dof_q = q.function_space().value_size
-    #     n_dof_aux = qaux.function_space().value_size
-
-    #     # Project components of q and qaux to scalar DG0 functions
-    #     subfuns = [
-    #         fd.project(q[i], V_scalar, name=names[i] if names else f"Q{i}")
-    #         for i in range(n_dof_q)
-    #     ] + [
-    #         fd.project(qaux[i], V_scalar, name=names[n_dof_q + i] if names else f"Qaux{i}")
-    #         for i in range(n_dof_aux)
-    #     ]
-
-    #     # Also include mesh coordinates for consistent output
-    #     mesh_coords = mesh.coordinates
-    #     mesh_coords.rename("mesh_coords")  # Naming prevents clashes
-
-    #     # Write mesh + scalar fields to output
-    #     # out.write(mesh_coords, *subfuns, time=time)
-    #     out.write(*subfuns, time=time)
+    # ------------------------------------------------------------------
+    # Main solve
+    # ------------------------------------------------------------------
 
     def solve(self, mshfile, model):
         # ----- 1. Setup -----
-        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index = self._setup(mshfile, model)
+        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index = \
+            self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
 
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
-        weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux, n, mesh,
-                                        map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+        weak_form = self._get_weak_form(
+            runtime_model, Qn, Qnp1, Qaux, n, mesh,
+            map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
+        )
         solver = self._get_solver(weak_form, Qnp1, Qaux)
 
-        # ---- 2. Write Output ----
+        # ---- 2. Output setup ----
         main_dir = misc.get_main_directory()
-        out = VTKFile(os.path.join(main_dir, self.settings.output.directory, "simulation.pvd"))
+        out = VTKFile(os.path.join(main_dir, self.settings.output.directory,
+                                   "simulation.pvd"))
+        out_id = VTKFile(os.path.join(main_dir, self.settings.output.directory,
+                                      "indicator.pvd"))
+        out_metric = VTKFile(os.path.join(main_dir, self.settings.output.directory,
+                                          "metric.pvd"))
+
+        # Write initial snapshot at t=0
         self.write_state(Qnp1, Qaux, out, time=sim_time)
+
+        # ---- 2b. Optional: initial adaptive refinement before time stepping ----
+        refinements_done = 0
+        if self.max_refinements > 0:
+            try:
+                logger.info("Initial adaptive refinement at t=0.0")
+                # Build metrics
+                M_wd, smooth_indicator = self._metric_wet_dry_smooth(Qnp1)
+                M_wave = self._metric_wave(Qnp1)
+
+                # Combine metrics (average here; could also intersect)
+                combined_metric = self._combine_metrics(
+                    [M_wd, M_wave], average=True
+                )
+
+                # Normalise to desired complexity (~ factor * ncells)
+                combined_metric = self._normalize_metric(
+                    combined_metric, mesh, target_factor=1.0, p=np.inf
+                )
+
+                # Save metric / indicator for debugging (optional)
+                # out_id.write(smooth_indicator, time=sim_time)
+                # out_metric.write(combined_metric, time=sim_time)
+
+                refined_mesh = adapt(mesh, combined_metric)
+                mesh = refined_mesh
+
+                # Rebuild function spaces on new mesh
+                nvar = runtime_model.n_variables
+                naux = runtime_model.n_aux_variables
+
+                V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=nvar)
+                Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=naux)
+
+                # Prolong state conservatively
+                Qn = self._prolong_vector_function(Qn, V)
+                Qnp1 = self._prolong_vector_function(Qnp1, V)
+
+                Qaux = fd.Function(Vaux, name="Qaux")
+                self.update_Qaux(Qn, Qaux)
+                self.update_Q(Qn, Qaux)
+                self.update_Q(Qnp1, Qaux)
+
+                compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
+
+                x, x_3d, n = self._get_x_and_n(mesh)
+                weak_form = self._get_weak_form(
+                    runtime_model, Qn, Qnp1, Qaux, n, mesh,
+                    map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
+                )
+                solver = self._get_solver(weak_form, Qnp1, Qaux)
+                refinements_done += 1
+                print(f"[AMR] Initial mesh refined to {mesh.num_cells()} cells")
+            except Exception as e:
+                print("Initial mesh refinement failed:", e)
+                traceback.print_exc()
+                # continue with unadapted mesh
 
         # ---- 3. Main time loop with AMR ----
         iteration = 0
@@ -202,16 +399,17 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         next_write_time = dt_snapshot
 
         while sim_time < self.time_end:
-            # advance in time
+            # 3a. Advance in time
             Qn.assign(Qnp1)
             self.update_Q(Qn, Qaux)
             self.update_Qaux(Qn, Qaux)
+
             dt.assign(compute_dt(Qn, Qaux))
             solver.solve()
             self.update_Q(Qnp1, Qaux)
+
             sim_time += float(dt)
             iteration += 1
-
 
             if iteration % 10 == 0:
                 logger.info(
@@ -219,68 +417,76 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                     f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
                 )
 
-            # ---- 5. AMR every `refine_every` iterations ----
-            if iteration % self.refine_every == 0 and iteration > 0:
-                logger.info(f"Refining at iteration {int(iteration)}, sim_time {float(sim_time):.6f}")
-                
+            # 3b. AMR every `refine_every` iterations (up to max_refinements)
+            if (
+                iteration % self.refine_every == 0
+                and iteration > 0
+                and refinements_done < self.max_refinements
+            ):
+                logger.info(
+                    f"Refining at iteration {int(iteration)}, "
+                    f"sim_time {float(sim_time):.6f}"
+                )
+
                 old_num_cells = mesh.num_cells()
-                try:    
-                    # (a) Compute indicator based on ∥∇h∥
-                    marker = self._marker_simple_slope(Qnp1, threshold=0.05)
-                    
-                    # Create tensor function space: DG0 with shape (2,2) for 2D
-                    V0 = fd.TensorFunctionSpace(mesh, "DG", 0, shape=(2, 2))  
+                try:
+                    # Build metrics from current state
+                    M_wd, smooth_indicator = self._metric_wet_dry_smooth(Qnp1)
+                    M_wave = self._metric_wave(Qnp1)
+                    # Optionally: M_bath = self._metric_bathymetry(Qnp1)
 
-                    # Instantiate the P0Metric explicitly on that space
-                    metric = P0Metric(V0)
+                    combined_metric = self._combine_metrics(
+                        [M_wd, M_wave], average=True
+                    )
+                    combined_metric = self._normalize_metric(
+                        combined_metric, mesh, target_factor=1.0, p=np.inf
+                    )
 
-                    # (c) Assign isotropic metric values
-                    indicator = marker.dat.data_ro        # shape: (ncells,)
-                    self.build_spd_metric_from_indicator(metric, indicator)
-                    
-                    values = np.zeros((len(indicator), 2, 2)) 
-                    values[:, 0, 0] = 0.8                # M_xx
-                    values[:, 1, 1] = 0.8                # M_yy
-                    metric.dat.data[:] = values           # assign all tensors
+                    # Optional debugging output
+                    # out_id.write(smooth_indicator, time=float(sim_time))
+                    # out_metric.write(combined_metric, time=float(sim_time))
 
-                    # (d) Adapt mesh using this metric
-                    refined_mesh = adapt(mesh, metric)
+                    refined_mesh = adapt(mesh, combined_metric)
                     mesh = refined_mesh
-                    # (d) Rebuild function spaces on the new mesh
+
+                    # Rebuild function spaces on new mesh
                     nvar = runtime_model.n_variables
                     naux = runtime_model.n_aux_variables
 
                     V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=nvar)
                     Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=naux)
 
-                    # (e) Prolong Qn and Qnp1
+                    # Prolong solutions
                     Qn_new = self._prolong_vector_function(Qn, V)
                     Qnp1_new = self._prolong_vector_function(Qnp1, V)
 
-                    # (f) Rebuild Qaux
                     Qaux_new = fd.Function(Vaux, name="Qaux")
                     self.update_Qaux(Qn_new, Qaux_new)
                     self.update_Q(Qn_new, Qaux_new)
                     self.update_Q(Qnp1_new, Qaux_new)
 
-                    # (g) Replace references
                     Qn, Qnp1, Qaux = Qn_new, Qnp1_new, Qaux_new
                     compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
 
-                    # (h) Rebuild weak form and solver
                     x, x_3d, n = self._get_x_and_n(mesh)
-                    weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux, n, mesh,
-                                                    map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+                    weak_form = self._get_weak_form(
+                        runtime_model, Qn, Qnp1, Qaux, n, mesh,
+                        map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
+                    )
                     solver = self._get_solver(weak_form, Qnp1, Qaux)
+
+                    refinements_done += 1
                 except Exception as e:
                     print("Mesh refinement failed:", e)
                     traceback.print_exc()
-                    raise 
+                    raise
+
                 new_num_cells = mesh.num_cells()
-
                 print(f"Mesh refined: {old_num_cells} → {new_num_cells} cells")
-            self.write_state(Qnp1, Qaux, out, time=sim_time)
 
+            # 3c. Output only when reaching the next snapshot time
+            if sim_time + 1e-12 >= next_write_time:
+                self.write_state(Qnp1, Qaux, out, time=sim_time)
+                next_write_time += dt_snapshot
 
         logger.info(f"Finished simulation in {sim_time:.3f} seconds")
-
