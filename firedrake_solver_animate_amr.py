@@ -18,9 +18,9 @@ import zoomy_firedrake.firedrake_solver as fd_solver
 
 from pyop2 import op2
 
-from animate.utility import VTKFile
-from animate.metric import RiemannianMetric, P0Metric
-from animate.adapt import adapt
+from firedrake_animate.animate.utility import VTKFile
+from firedrake_animate.animate.metric import RiemannianMetric, P0Metric
+from firedrake_animate.animate.adapt import adapt
 
 from firedrake.projection import Projector
 from firedrake.petsc import PETSc
@@ -63,24 +63,11 @@ def grow_indicator(ind_dg0: fd.Function, width: int = 1) -> fd.Function:
 @define(frozen=True, slots=True, kw_only=True)
 class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     refine_every: int = field(default=20)      # time steps between refinements
-    max_refinements: int = field(default=6)    # total refinement steps
+    enable_amr: bool = field(default=True)    # total refinement steps
 
     # ------------------------------------------------------------------
     # Metric helpers based on RiemannianMetric
     # ------------------------------------------------------------------
-
-    def _normalize_metric(self, metric: RiemannianMetric, mesh, target_factor=1.0, p=np.inf):
-        """
-        Use Animate's RiemannianMetric.normalise() to scale the metric
-        to a desired complexity: target_factor × (#cells).
-        """
-        target_complexity = float(target_factor * mesh.num_cells())
-        params = metric.metric_parameters.copy()
-        params["dm_plex_metric_target_complexity"] = target_complexity
-        params["dm_plex_metric_p"] = p
-        metric.set_parameters(params)
-        metric.normalise()
-        return metric
 
     def _metric_wet_dry_smooth(self, Q, h_dry=1.0e-4, width=3, gamma=20.0):
         """
@@ -164,91 +151,149 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         metric.compute_isotropic_metric(weight, interpolant="L2")
         metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
         return metric
-
-    def _metric_wave(self, Q,
-                     L_stream=0.5,     # multiples of L0
-                     L_cross=1.6,
-                     vel_floor=1e-8,
-                     L0=1.0):
+    
+    def _metric_shock(self, Q,
+                  gamma=20.0,            # refinement factor between weak/strong shocks
+                  aniso=0.5,             # anisotropy ratio h_tang / h_norm (0<aniso≤1)
+                  grad_eps=1.0e-12):     # to avoid division by zero
         """
-        Flow-aligned anisotropic metric:
+        Build an anisotropic metric that refines across steep fronts of h.
 
-        - Compute velocity (u, v)
-        - Build a P0Metric per cell with eigenvectors aligned to flow
-        - Project to CG1 RiemannianMetric
+        Parameters
+        ----------
+        Q      : Vector Function with components [b, h, hu, hv, …]
+        gamma  : float   – maximal contrast in edge length between regions
+        aniso  : float   – ratio of tangential vs. normal edge length (≤1)
+        grad_eps : float – floor for |∇h| when determining directions
         """
-        L_stream *= L0
-        L_cross *= L0
+        mesh = Q.function_space().mesh()
+        dim  = mesh.geometric_dimension()     # expect 2
 
+        # --- 1. Compute gradient of h on CG1 for smoothness -------------
+        h_dg  = Q.sub(1)                      # DG0
+        Vcg1  = fd.FunctionSpace(mesh, "CG", 1)
+        h_cg  = fd.interpolate(h_dg, Vcg1)
+
+        grad_h = fd.grad(h_cg)
+        grad_sq= fd.Function(Vcg1)
+        grad_sq.interpolate(fd.inner(grad_h, grad_h))  # |∇h|²
+
+        # --- 2. Bring everything to DG0 ---------------------------------
+        V0  = fd.FunctionSpace(mesh, "DG", 0)
+        gmag = fd.Function(V0)
+        gmag.interpolate(fd.sqrt(grad_sq))    # |∇h| in DG0
+
+        # normal vector components in DG0
+        gx_dg = fd.Function(V0); gy_dg = fd.Function(V0)
+        gx_dg.interpolate(grad_h[0]); gy_dg.interpolate(grad_h[1])
+
+        # --- 3. Normalise gradient to get shock normal ------------------
+        gx = gx_dg.dat.data_ro
+        gy = gy_dg.dat.data_ro
+        mag= gmag.dat.data_ro
+
+        # --- 4. Prepare metric function ---------------------------------
+        Vten = fd.TensorFunctionSpace(mesh, "DG", 0, shape=(dim, dim))
+        M    = P0Metric(Vten)
+        data = M.dat.data
+        I2   = np.eye(dim)
+
+        # global max gradient (MPI-safe) – used for scaling
+        gmax = mesh.comm.allreduce(float(mag.max()), op=MPI.MAX)
+        if gmax < grad_eps:
+            # flow is essentially smooth everywhere; return coarse metric
+            data[:] = I2
+            return M
+
+        for c in range(mesh.num_cells()):
+            g = mag[c]
+            if g < grad_eps:
+                data[c,:,:] = I2                        # no shock
+                continue
+
+            # normalised normal vector
+            nx = gx[c]/g
+            ny = gy[c]/g
+            nvec = np.array([nx, ny])
+            tvec = np.array([-ny, nx])                 # tangential direction
+
+            # scale factor grows with normalised gradient strength
+            s = g / gmax               # 0 … 1
+            h_norm  = 1.0 / (1.0 + gamma*s)            # small across shock
+            h_tang  = h_norm / aniso                   # larger along front
+
+            lam_n = 1.0 / h_norm**2
+            lam_t = 1.0 / h_tang**2
+
+            data[c,:,:] = lam_n*np.outer(nvec, nvec) + \
+                        lam_t*np.outer(tvec, tvec)
+
+        return M            # already a P0Metric, no extra project/normalise here
+
+    def _metric_wave(self, Q, gamma=1.0, aniso=1.0):
+        """
+        Build a flow-aligned anisotropic Riemannian metric.
+
+        Parameters:
+        -----------
+        Q : Function
+            Current solution vector (assumed DG/VF with [h, hu, hv] ordering).
+        gamma : float
+            Controls refine strength between low- and high-speed flow.
+            - Higher gamma means more contrast in scale between fast/slow regions.
+        aniso : float in (0,1]
+            Controls directional anisotropy.
+            - aniso = 1.0 → isotropic metric.
+            - aniso < 1.0 → cells are stretched along flow direction.
+        """
         mesh = Q.function_space().mesh()
         h, hu, hv = Q.sub(1), Q.sub(2), Q.sub(3)
 
-        V0 = h.function_space()
-        u = fd.Function(V0)
-        v = fd.Function(V0)
+        # Compute velocity (u, v) and speed
+        u = fd.Function(h.function_space(), name="u").interpolate(hu / (h + 1e-14))
+        v = fd.Function(h.function_space(), name="v").interpolate(hv / (h + 1e-14))
+        speed = np.sqrt(u.dat.data_ro**2 + v.dat.data_ro**2)
 
-        u.interpolate(fd.conditional(h > vel_floor, hu / h, 0.0))
-        v.interpolate(fd.conditional(h > vel_floor, hv / h, 0.0))
-
-        u_arr = u.dat.data_ro
-        v_arr = v.dat.data_ro
-        speed = np.sqrt(u_arr**2 + v_arr**2)
-
-        # global max speed (MPI-safe)
+        # Global normalized magnitude for refinement scaling
         max_speed = mesh.comm.allreduce(float(speed.max()), op=MPI.MAX)
-        max_speed = max(max_speed, vel_floor)
+        norm_speed = speed / max_speed if max_speed > 0 else speed  # ∈ [0,1]
 
-        # Build DG0 tensor metric first (P0Metric)
+        # Metric in DG0
         Vten0 = fd.TensorFunctionSpace(mesh, "DG", 0, shape=(2, 2))
         M_p0 = P0Metric(Vten0)
-        data = M_p0.dat.data
-        I2 = np.eye(2)
 
-        lam_cross = 1.0 / L_cross**2
         for c in range(mesh.num_cells()):
-            s = speed[c] / max_speed    # 0…1
-            if s < 0.05:                # almost stagnant
-                data[c, :, :] = I2 * lam_cross
+            s = norm_speed[c]
+            if s == 0.0:
+                # Isotropic tensor (unrefined base)
+                M_p0.dat.data[c, :, :] = np.eye(2)
                 continue
-            nx, ny = u_arr[c] / speed[c], v_arr[c] / speed[c]
+
+            # Velocity direction
+            nx, ny = u.dat.data_ro[c] / (speed[c] + 1e-14), v.dat.data_ro[c] / (speed[c] + 1e-14)
             vdir = np.array([nx, ny])
             tdir = np.array([-ny, nx])
-            lam_stream = 1.0 / (L_stream * (1 - 0.8 * s))**2
-            data[c, :, :] = (
-                lam_stream * np.outer(vdir, vdir)
-                + lam_cross * np.outer(tdir, tdir)
+
+            # Scaling based on speed: 1 + gamma*s ∈ [1, 1+gamma]
+            scale = 1.0 + gamma * s
+
+            # Anisotropic eigenvalues (stream aligned smaller = more refined)
+            lam_stream = scale * aniso
+            lam_cross = scale
+
+            M_p0.dat.data[c, :, :] = (
+                lam_stream * np.outer(vdir, vdir) +
+                lam_cross * np.outer(tdir, tdir)
             )
 
-        # Project to CG1 Riemannian metric
+        # Project to P1 Metric
         metric = RiemannianMetric(mesh, name="wave_metric")
         metric.project(M_p0)
+
+        # Enforce positive-definite constraints
         metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
         return metric
 
-    def _combine_metrics(self, metrics, weights=None, average=True):
-        """
-        Combine several RiemannianMetrics using Animate's combine/average machinery.
-
-        metrics  – list[RiemannianMetric]
-        weights  – optional list of floats; len = nmetrics
-        """
-        assert len(metrics) > 0
-        base = metrics[0].copy(deepcopy=True)
-        others = metrics[1:]
-        if not others:
-            return base
-        if average:
-            if weights is None:
-                return base.average(*others)
-            else:
-                if len(weights) != len(metrics):
-                    raise ValueError(
-                        f"weights has length {len(weights)}, but metrics has {len(metrics)}"
-                    )
-                return base.average(*others, weights=weights)
-        else:
-            # Intersection
-            return base.intersect(*others)
 
     # ------------------------------------------------------------------
     # Prolongation: conservative + positivity preserving
@@ -302,7 +347,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         ]
 
         vtk_file.write(*fields, time=time)
-        print(f"[VTK] Exported timestep {time:.4f} with {mesh.num_cells()} cells.")
 
     # ------------------------------------------------------------------
     # Main solve
@@ -310,7 +354,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
 
     def solve(self, mshfile, model):
         # ----- 1. Setup -----
-        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index = \
+        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index = \
             self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
 
@@ -319,10 +363,9 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         dt = fd.Constant(0.1)
 
         weak_form = self._get_weak_form(
-            runtime_model, Qn, Qnp1, Qaux, n, mesh,
+            runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh,
             map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
         )
-        solver = self._get_solver(weak_form, Qnp1, Qaux)
 
         # ---- 2. Output setup ----
         main_dir = misc.get_main_directory()
@@ -334,95 +377,29 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                                           "metric.pvd"))
 
         # Write initial snapshot at t=0
-        self.write_state(Qnp1, Qaux, out, time=sim_time)
+        self.write_state(Qnp1, Qaux_n, out, time=sim_time)
 
-        # ---- 2b. Optional: initial adaptive refinement before time stepping ----
-        refinements_done = 0
-        if self.max_refinements > 0:
-            try:
-                logger.info("Initial adaptive refinement at t=0.0")
-                # Build metrics
-                M_wd, smooth_indicator = self._metric_wet_dry_smooth(Qnp1)
-                M_wave = self._metric_wave(Qnp1)
-
-                # Combine metrics (average here; could also intersect)
-                combined_metric = self._combine_metrics(
-                    [M_wd, M_wave], average=True
-                )
-
-                # Normalise to desired complexity (~ factor * ncells)
-                combined_metric = self._normalize_metric(
-                    combined_metric, mesh, target_factor=1.0, p=np.inf
-                )
-
-                # Save metric / indicator for debugging (optional)
-                # out_id.write(smooth_indicator, time=sim_time)
-                # out_metric.write(combined_metric, time=sim_time)
-
-                refined_mesh = adapt(mesh, combined_metric)
-                mesh = refined_mesh
-
-                # Rebuild function spaces on new mesh
-                nvar = runtime_model.n_variables
-                naux = runtime_model.n_aux_variables
-
-                V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=nvar)
-                Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=naux)
-
-                # Prolong state conservatively
-                Qn = self._prolong_vector_function(Qn, V)
-                Qnp1 = self._prolong_vector_function(Qnp1, V)
-
-                Qaux = fd.Function(Vaux, name="Qaux")
-                self.update_Qaux(Qn, Qaux)
-                self.update_Q(Qn, Qaux)
-                self.update_Q(Qnp1, Qaux)
-
-                compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
-
-                x, x_3d, n = self._get_x_and_n(mesh)
-                weak_form = self._get_weak_form(
-                    runtime_model, Qn, Qnp1, Qaux, n, mesh,
-                    map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
-                )
-                solver = self._get_solver(weak_form, Qnp1, Qaux)
-                refinements_done += 1
-                print(f"[AMR] Initial mesh refined to {mesh.num_cells()} cells")
-            except Exception as e:
-                print("Initial mesh refinement failed:", e)
-                traceback.print_exc()
-                # continue with unadapted mesh
 
         # ---- 3. Main time loop with AMR ----
         iteration = 0
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
         next_write_time = dt_snapshot
+        
+        V1 = fd.FunctionSpace(mesh, "CG", 1)
+        metric = RiemannianMetric(mesh, name="initial_metric")
+        scaled = fd.Function(V1)
+        scaled.interpolate(1.0)
+        metric.compute_isotropic_metric(scaled, interpolant="L2")
+        mesh_complexity = metric.complexity()
+        print(f"Target mesh complexity for AMR: {mesh_complexity}")
+
+        solver = self._get_solver(weak_form, Qnp1, Qaux_np1)
+        solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_np1)
+        solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_np1)
 
         while sim_time < self.time_end:
-            # 3a. Advance in time
-            Qn.assign(Qnp1)
-            self.update_Q(Qn, Qaux)
-            self.update_Qaux(Qn, Qaux)
-
-            dt.assign(compute_dt(Qn, Qaux))
-            solver.solve()
-            self.update_Q(Qnp1, Qaux)
-
-            sim_time += float(dt)
-            iteration += 1
-
-            if iteration % 10 == 0:
-                logger.info(
-                    f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
-                    f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
-                )
-
-            # 3b. AMR every `refine_every` iterations (up to max_refinements)
-            if (
-                iteration % self.refine_every == 0
-                and iteration > 0
-                and refinements_done < self.max_refinements
-            ):
+                        # 3b. AMR every `refine_every` iterations (up to max_refinements)
+            if (iteration % self.refine_every == 0):
                 logger.info(
                     f"Refining at iteration {int(iteration)}, "
                     f"sim_time {float(sim_time):.6f}"
@@ -430,23 +407,22 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
 
                 old_num_cells = mesh.num_cells()
                 try:
-                    # Build metrics from current state
-                    M_wd, smooth_indicator = self._metric_wet_dry_smooth(Qnp1)
-                    M_wave = self._metric_wave(Qnp1)
-                    # Optionally: M_bath = self._metric_bathymetry(Qnp1)
+                    M_wave = self._metric_wave(Qnp1, gamma=1.0, aniso=0.5)  # Strong refinement in fast regions
+                    M_wd, _ = self._metric_wet_dry_smooth(Qnp1, gamma=10000, width=1)
+                    # M_shock = self._metric_shock(Qnp1, gamma=1.0, aniso=0.5)
 
-                    combined_metric = self._combine_metrics(
-                        [M_wd, M_wave], average=True
-                    )
-                    combined_metric = self._normalize_metric(
-                        combined_metric, mesh, target_factor=1.0, p=np.inf
-                    )
+                    # Combine and normalize via Animate:
+                    combined_metric = M_wd
+                    # combined_metric = M_wd.combine(M_wave, average=True)  # intersection
+                    # combined_metric = M_wd.combine(M_shock, average=True)  # intersection
 
-                    # Optional debugging output
-                    # out_id.write(smooth_indicator, time=float(sim_time))
-                    # out_metric.write(combined_metric, time=float(sim_time))
-
+                    combined_metric.set_parameters({
+                        "dm_plex_metric_target_complexity": mesh_complexity,
+                        "dm_plex_metric_p": np.inf,
+                    })
+                    combined_metric.normalise()
                     refined_mesh = adapt(mesh, combined_metric)
+                    print(f"New mesh complexity for AMR: {metric.complexity()}")
                     mesh = refined_mesh
 
                     # Rebuild function spaces on new mesh
@@ -460,22 +436,27 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                     Qn_new = self._prolong_vector_function(Qn, V)
                     Qnp1_new = self._prolong_vector_function(Qnp1, V)
 
-                    Qaux_new = fd.Function(Vaux, name="Qaux")
-                    self.update_Qaux(Qn_new, Qaux_new)
-                    self.update_Q(Qn_new, Qaux_new)
-                    self.update_Q(Qnp1_new, Qaux_new)
+                    Qaux_new_n = fd.Function(Vaux, name="Qaux")
+                    Qaux_new_np1 = fd.Function(Vaux, name="Qaux")
 
-                    Qn, Qnp1, Qaux = Qn_new, Qnp1_new, Qaux_new
+                    
+                    self.update_Qaux(Qn_new, Qaux_new_n)
+                    self.update_Qaux(Qnp1_new, Qaux_new_np1)
+                    self.update_Q(Qn_new, Qaux_new_n)
+                    self.update_Q(Qnp1_new, Qaux_new_np1)
+
+                    Qn, Qnp1, Qaux_n , Qaux_np1= Qn_new, Qnp1_new, Qaux_new_n, Qaux_new_np1
                     compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
 
                     x, x_3d, n = self._get_x_and_n(mesh)
                     weak_form = self._get_weak_form(
-                        runtime_model, Qn, Qnp1, Qaux, n, mesh,
+                        runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh,
                         map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
                     )
-                    solver = self._get_solver(weak_form, Qnp1, Qaux)
+                    solver = self._get_solver(weak_form, Qnp1, Qaux_np1)
+                    solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_np1)
+                    solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_np1)
 
-                    refinements_done += 1
                 except Exception as e:
                     print("Mesh refinement failed:", e)
                     traceback.print_exc()
@@ -483,10 +464,36 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
 
                 new_num_cells = mesh.num_cells()
                 print(f"Mesh refined: {old_num_cells} → {new_num_cells} cells")
+                
+            # 3b. Advance in time
+            Qn.assign(Qnp1)
+            self.update_Q(Qn, Qaux_n)
+            self.update_Qaux(Qn, Qaux_n)
+            self.update_Q(Qnp1, Qaux_np1)
+            self.update_Qaux(Qnp1, Qaux_np1)
+
+            dt.assign(compute_dt(Qn, Qaux_n))
+            solver.solve()
+            # try:
+            #     solver_picard.solve()
+            # except:
+            #     logger.info("Picard pre-solve exited with DTOL; continuing with Newton")
+            # solver_newton.solve()
+            # self.update_Q(Qnp1, Qaux_np1)
+
+            sim_time += float(dt)
+            iteration += 1
+
+            if iteration % 10 == 0:
+                logger.info(
+                    f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
+                    f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
+                )
+
 
             # 3c. Output only when reaching the next snapshot time
             if sim_time + 1e-12 >= next_write_time:
-                self.write_state(Qnp1, Qaux, out, time=sim_time)
+                self.write_state(Qnp1, Qaux_n, out, time=sim_time)
                 next_write_time += dt_snapshot
 
         logger.info(f"Finished simulation in {sim_time:.3f} seconds")

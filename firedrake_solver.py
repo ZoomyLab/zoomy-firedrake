@@ -352,25 +352,27 @@ class FiredrakeHyperbolicSolver:
         Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
         Qn = fd.Function(V)
         Qnp1 = fd.Function(V)
-        Qaux = fd.Function(Vaux)
-        
+        Qaux_n = fd.Function(Vaux)        
+        Qaux_np1 = fd.Function(Vaux)
+
         self.set_initial_condition(Qn, model)
         self.set_initial_condition(Qnp1, model)
-        self.update_Qaux(Qn, Qaux)
-        self.update_Qaux(Qnp1, Qaux)
-        self.update_Q(Qn, Qaux)
-        self.update_Q(Qnp1, Qaux)
+        self.update_Qaux(Qn, Qaux_n)
+        self.update_Qaux(Qnp1, Qaux_np1)
+        self.update_Q(Qn, Qaux_n)
+        self.update_Q(Qnp1, Qaux_np1)
         
         # Collect all boundary tags
         map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
         
-        return mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index 
+        return mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index 
     
-    def _get_weak_form(self, runtime_model, Qn, Qnp1, Qaux, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
+    def _get_weak_form(self, runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
         test_q = fd.TestFunction(Qn.function_space())
         trial_q = fd.TrialFunction(Qn.function_space())
               
         Q = Qn
+        Qaux = Qaux_n
 
         # linear problem
         # weak_form = fd.dot(test_q, (trial_q-Qn) / dt) * fd.dx      
@@ -385,8 +387,8 @@ class FiredrakeHyperbolicSolver:
                     runtime_model,
                     Q("+"),
                     Q("-"),
-                    Qaux("+"),
-                    Qaux("-"),
+                    Qaux_n("+"),
+                    Qaux_n("-"),
                     runtime_model.parameters,
                     n("+"),
                     mesh,
@@ -397,7 +399,7 @@ class FiredrakeHyperbolicSolver:
         
 
         nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
-        Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux("-"), Qaux("+"), n("-"))
+        Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux_n("-"), Qaux_n("+"), n("-"))
         weak_form += 0.5*(
             fd.dot(
                 test_q("+"),
@@ -424,16 +426,16 @@ class FiredrakeHyperbolicSolver:
                 x_3d,
                 dX,
                 Q,
-                Qaux,
+                Qaux_n,
                 runtime_model.parameters,
                 n,          
             )
             weak_form += ufl.dot(
                 test_q,
-                self.numerical_flux(runtime_model, Q, Q_bnd, Qaux, Qaux, runtime_model.parameters, n, mesh)
+                self.numerical_flux(runtime_model, Q, Q_bnd, Qaux_n, Qaux_n, runtime_model.parameters, n, mesh)
             ) * fd.ds(tag)
             
-            Dp, Dm = nc_flux(Q, Q_bnd, Qaux, Qaux, n)
+            Dp, Dm = nc_flux(Q, Q_bnd, Qaux_n, Qaux_n, n)
             weak_form += (
                 fd.dot(
                     test_q,
@@ -441,18 +443,18 @@ class FiredrakeHyperbolicSolver:
                     )
                 ) * fd.ds(tag)
 
-        
-        source = runtime_model.source(Qnp1, Qaux, runtime_model.parameters)
-        if not isinstance(source, ufl.constantvalue.Zero):
-            weak_form -= fd.dot(
-                test_q,
-                source,
-            ) * fd.dx
+        theta = 0.0
+        # source = runtime_model.source(theta*(Qnp1 + Qn), (1-theta)*(Qaux_np1+Qaux_n), runtime_model.parameters)
+        # if not isinstance(source, ufl.constantvalue.Zero):
+        #     weak_form -= fd.dot(
+        #         test_q,
+        #         source,
+        #     ) * fd.dx
             
         return weak_form
     
-    def _get_solver(self, weak_form, Qnp1, Qaux):
-         # a = fd.lhs(weak_form)
+    def _get_solver(self, weak_form, Qnp1, Qaux_np1):
+        # a = fd.lhs(weak_form)
         # L = fd.rhs(weak_form)
         # problem = fd.LinearVariationalProblem(a, L, Qnp1)
         # solver = fd.LinearVariationalSolver(
@@ -486,14 +488,91 @@ class FiredrakeHyperbolicSolver:
 
         def callback(snes, it, rnorm):
             # This is called each nonlinear iteration
-            self.update_Q(Qnp1, Qaux)
-            self.update_Qaux(Qnp1, Qaux)
+            self.update_Q(Qnp1, Qaux_np1)
+            self.update_Qaux(Qnp1, Qaux_np1)
 
         snes.setMonitor(callback)
         return solver
+    
+    def _build_problem(self, weak_form, Qnp1, with_jacobian: bool):
+        if with_jacobian:
+            J = fd.derivative(weak_form, Qnp1)
+            return fd.NonlinearVariationalProblem(weak_form, Qnp1, J=J)
+        else:
+            return fd.NonlinearVariationalProblem(weak_form, Qnp1)  # no J
+
+
+    
+    def _get_solver_picard(self, weak_form, Qnp1, Qaux):
+        
+        problem = self._build_problem(weak_form, Qnp1, with_jacobian=False)
+        picard_sp = {
+            # Picard / fixed-point, matrix-free
+            "snes_type":        "nrichardson",
+            "snes_mf_operator": True,
+            "snes_max_it":      5,        # do up to 5 iterations
+
+            # linear solve
+            "ksp_type":         "gmres",
+            "pc_type":          "ilu",
+            "ksp_rtol":         1.0e-6,
+
+            # turn off convergence tests that cause DTOL
+            "snes_rtol": 0.0,             # ignore relative residual
+            "snes_atol": 0.0,             # ignore absolute residual
+            "snes_stol": 0.0,             # ignore step tolerance
+            "snes_dtol": 0.0,             # disable difference test
+
+            # keep going even if SNES still complains
+            "error_on_nonconvergence": False,
+        }
+        picard = fd.NonlinearVariationalSolver(problem, solver_parameters=picard_sp)
+        
+        def cb(snes, it, rnorm):
+            self.update_Q(Qnp1, Qaux)
+            self.update_Qaux(Qnp1, Qaux)
+        picard.snes.setMonitor(cb)
+        return picard
+
+    
+    def _get_solver_newton(self, weak_form, Qnp1, Qaux):
+        problem = self._build_problem(weak_form, Qnp1, with_jacobian=True)
+        # newton_sp = {
+        #     "snes_type":               "newtonls",
+        #     "snes_linesearch_type":    "bt",
+        #     "snes_linesearch_damping": 0.8,
+        #     "snes_max_it":             25,
+        #     "ksp_type":                "gmres",
+        #     "pc_type":                 "lu",
+        #     "pc_factor_shift_type":    "nonzero",
+        #     "ksp_error_if_not_converged": False,
+        # }
+        
+        newton_sp = {
+            "snes_type":            "newtonls",
+            "snes_linesearch_type": "bt",
+            "snes_linesearch_damping": 0.8,
+            "snes_rtol": 1.0e-6,
+            "snes_atol": 1.0e-8,
+            "snes_dtol": 0.0,                 # disable DTOL
+            "snes_max_it": 50,
+
+            "ksp_type": "gmres",
+            "pc_type":  "lu",
+            "ksp_error_if_not_converged": False,
+            "error_on_nonconvergence": False,
+        }
+        newton = fd.NonlinearVariationalSolver(problem, solver_parameters=newton_sp)
+
+        def cb(snes, it, rnorm):
+            self.update_Q(Qnp1, Qaux)
+            self.update_Qaux(Qnp1, Qaux)
+        newton.snes.setMonitor(cb)
+
+        return newton
 
     def solve(self, mshfile, model):
-        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux, map_boundary_tag_to_function_index = self._setup(mshfile, model)
+        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index = self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
         
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
@@ -501,14 +580,16 @@ class FiredrakeHyperbolicSolver:
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
-        weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
-            
-
-        solver = self._get_solver(weak_form, Qnp1, Qaux)
+        weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+        
+        # solver = self._get_solver(weak_form, Qnp1, Qaux)
+        solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_n)
+        solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_n)
+        
         
         main_dir = misc.get_main_directory()
         out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
-        self.write_state(Qnp1, Qaux, out, time=sim_time)
+        self.write_state(Qnp1, Qaux_n, out, time=sim_time)
         dx_ref = mesh.cell_sizes.dat.data_ro.min()
         iteration = 0
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
@@ -517,16 +598,20 @@ class FiredrakeHyperbolicSolver:
         
         while sim_time < self.time_end:
             Qn.assign(Qnp1)
-            self.update_Q(Qn, Qaux)
-            self.update_Qaux(Qn, Qaux)
-            dt.assign(compute_dt(Qn, Qaux))
-            solver.solve()
-            self.update_Q(Qnp1, Qaux)
+            self.update_Q(Qn, Qaux_n)
+            self.update_Qaux(Qn, Qaux_n)
+            dt.assign(compute_dt(Qn, Qaux_n))
+            try:
+                solver_picard.solve()
+            except :
+                logger.info("Picard pre-solve exited with DTOL; continuing with Newton")
+            solver_newton.solve()
+            self.update_Q(Qnp1, Qaux_n)
             sim_time += float(dt)
             iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
                 next_write_time += dt_snapshot
-                self.write_state(Qnp1, Qaux, out, time=sim_time)
+                self.write_state(Qnp1, Qaux_n, out, time=sim_time)
             if iteration % 10 == 0:
                 logger.info(
                     f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
