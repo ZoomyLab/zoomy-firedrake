@@ -14,6 +14,7 @@ import zoomy_core.misc.misc as misc
 import os
 
 import meshio
+from time import time as get_time
 
 
 
@@ -167,14 +168,7 @@ class FiredrakeHyperbolicSolver:
         num_flux = fd.dot(central_flux, n) - 0.5 * ufl.max_value(alpha_L, alpha_R) * fd.dot(self.IdentityMatrix, (Qr_star - Ql_star))
 
         return num_flux
-    
-    # def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
-    #     return fd.dot(
-    #         0.5
-    #         * (model.flux(Ql, Qauxl, parameters) + model.flux(Qr, Qauxr, parameters)),
-    #         n,
-    #     ) - 0.5 * self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh) * (Qr - Ql)
-        
+      
 
     def max_abs_eigenvalue(self, model, Q, Qaux, n, mesh):
         ev = model.eigenvalues(Q, Qaux, model.parameters, n)
@@ -240,11 +234,6 @@ class FiredrakeHyperbolicSolver:
             h_new * v_new,      # zero momentum if dry
         ])
         Q.interpolate(Q_new)
-
-
-        
-
-
 
     def get_function_coordinates(self, Q):
         """
@@ -313,21 +302,6 @@ class FiredrakeHyperbolicSolver:
         Qarr = Q.dat.data
         Q.dat.data[:] = model.initial_conditions.apply(coords.T, Qarr.T).T
         
-    def solve_with_callback(self, problem, Qnp1, Qaux, update_fn, solver_parameters=None):
-        solver = fd.NonlinearVariationalSolver(problem, solver_parameters=solver_parameters or {})
-
-        # Access the underlying SNES object
-        snes = solver.snes
-
-        # Define callback
-        def update_callback(snes, it, rnorm):
-            update_fn(Qnp1, Qaux)
-
-        # Attach it
-        snes.setMonitor(update_callback)
-
-        # Solve
-        solver.solve()
         
     def _get_x_and_n(self, mesh):
         x = fd.SpatialCoordinate(mesh)
@@ -348,36 +322,32 @@ class FiredrakeHyperbolicSolver:
         runtime_model = UFLRuntimeModel(model)
 
 
-        V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
-        Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
-        Qn = fd.Function(V)
-        Qnp1 = fd.Function(V)
-        Qaux_n = fd.Function(Vaux)        
-        Qaux_np1 = fd.Function(Vaux)
+        Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = self._get_functionspaces(mesh, runtime_model)
 
         self.set_initial_condition(Qn, model)
+        self.set_initial_condition(Qs, model)
         self.set_initial_condition(Qnp1, model)
         self.update_Qaux(Qn, Qaux_n)
+        self.update_Qaux(Qs, Qaux_s)
         self.update_Qaux(Qnp1, Qaux_np1)
         self.update_Q(Qn, Qaux_n)
+        self.update_Q(Qs, Qaux_s)
         self.update_Q(Qnp1, Qaux_np1)
         
         # Collect all boundary tags
         map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
         
-        return mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index 
+        return mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index 
     
-    def _get_weak_form(self, runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
+    def _get_weak_form_convective(self, runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
         test_q = fd.TestFunction(Qn.function_space())
         trial_q = fd.TrialFunction(Qn.function_space())
               
         Q = Qn
         Qaux = Qaux_n
-
-        # linear problem
-        # weak_form = fd.dot(test_q, (trial_q-Qn) / dt) * fd.dx      
-        # nonlinear version
-        weak_form = fd.dot(test_q, (Qnp1-Qn) / dt) * fd.dx
+        
+        weak_form = fd.dot(test_q, (trial_q-Qn) / dt) * fd.dx  
+        # weak_form = fd.dot(test_q, (Qnp1-Qn) / dt) * fd.dx  
 
         
         weak_form += (
@@ -442,56 +412,137 @@ class FiredrakeHyperbolicSolver:
                     Dm
                     )
                 ) * fd.ds(tag)
-
-        theta = 0.0
-        # source = runtime_model.source(theta*(Qnp1 + Qn), (1-theta)*(Qaux_np1+Qaux_n), runtime_model.parameters)
-        # if not isinstance(source, ufl.constantvalue.Zero):
-        #     weak_form -= fd.dot(
-        #         test_q,
-        #         source,
-        #     ) * fd.dx
-            
         return weak_form
     
-    def _get_solver(self, weak_form, Qnp1, Qaux_np1):
-        # a = fd.lhs(weak_form)
-        # L = fd.rhs(weak_form)
-        # problem = fd.LinearVariationalProblem(a, L, Qnp1)
-        # solver = fd.LinearVariationalSolver(
-        #     # problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
-        #     problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "lu"}
+    def _get_weak_form_source(
+        self,
+        runtime_model,
+        Q_star,      # this is Qs from the convective step
+        Qnp1,        # unknown for the source step
+        Qaux_star,
+        Qaux_np1,
+        n, mesh, map_boundary_tag_to_function_index,
+        sim_time, dt, x, x_3d,
+        theta=1.0
+    ):
+        """
+        Source step: evolve only momentum components (indices 2, 3).
 
-        # )
+        We build a residual like
+            (Qnp1[i] - Q_star[i])/dt = S_i(...)
+        for i in mom_var = [2, 3],
+        and 0 for i = 0,1.
+        """
+
+        mom_var = [1, 2, 3]  # momentum indices
+
+        V = Qnp1.function_space()
+        test_q = fd.TestFunction(V)
+        ncomp = V.value_size
+
+        # θ-method interpolation (only really matters for momentum; b,h are irrelevant for S)
+        Q_theta    = theta*Qnp1    + (1.0 - theta)*Q_star
+        Qaux_theta = theta*Qaux_np1 + (1.0 - theta)*Qaux_star
+
+        # Full source vector from the model (your new implementation only depends on hU, hinv)
+        source_full = runtime_model.source(Q_theta, Qaux_theta, runtime_model.parameters)
+
+        zero = fd.Constant(0.0)
+
+        # Build vectors that are nonzero only for momentum components
+        diff_restricted = []
+        source_restricted = []
+
+        for i in range(ncomp):
+            if i in mom_var:
+                diff_restricted.append(Qnp1[i] - Q_star[i])
+                source_restricted.append(source_full[i])
+            else:
+                diff_restricted.append(zero)
+                source_restricted.append(zero)
+
+        diff_restricted   = fd.as_vector(diff_restricted)
+        source_restricted = fd.as_vector(source_restricted)
+
+        # Weak form: only momentum components contribute because others are zeroed out
+        weak_form  = fd.dot(test_q, diff_restricted/dt) * fd.dx
+        weak_form -= fd.dot(test_q, source_restricted) * fd.dx
+
+        return weak_form
+
+
+    
+    def _get_linear_solver(self, weak_form, Qnp1, Qaux_np1):
+        a = fd.lhs(weak_form)
+        L = fd.rhs(weak_form)
+        problem = fd.LinearVariationalProblem(a, L, Qnp1)
+        solver = fd.LinearVariationalSolver(
+            # problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "jacobi"}
+            problem, solver_parameters={"ksp_type": "bcgs", "pc_type": "lu"}
+
+        )
+        return solver
+    
+    def _get_nonlinear_solver(self, weak_form, Qnp1, Qaux_np1):
+
         
         J = fd.derivative(weak_form, Qnp1)
         problem = fd.NonlinearVariationalProblem(weak_form, Qnp1, J=J)
+        
+        # solver_parameters={
+        #     "snes_type": "newtonls",
+        #     "ksp_error_if_not_converged": True,
+        #     "ksp_type": "gmres",
+        #     "pc_type": "lu"
+        # }
+        solver_parameters={
+            "snes_type": "newtonls",
+            "snes_linesearch_type": "bt",
+            "snes_linesearch_damping": 0.8,
+            "snes_max_it": 25,
+            "snes_rtol": 1e-8,
+            "snes_atol": 1e-10,
+            "snes_stol": 1e-12,
+            "ksp_type": "bcgs",
+            "pc_type": "jacobi",
+        }
+        # solver_parameters = {
+        #     "snes_type": "nrichardson",
+        #     "snes_mf_operator": True,
+
+        #     # Allow several iterations
+        #     "snes_max_it": 10,
+
+        #     # Disable DTOL and step-based divergence
+        #     "snes_dtol": -1.0,
+        #     "snes_stol": -1.0,
+
+        #     # Let Picard converge normally:
+        #     "snes_rtol": 1e-8,
+        #     "snes_atol": 1e-10,
+
+        #     "ksp_type": "gmres",
+        #     "pc_type": "lu",
+
+        #     "error_on_nonconvergence": False,
+        #     "ksp_error_if_not_converged": False,
+        #     "snes_monitor": None,
+        #     "snes_linesearch_monitor": None,
+        #     "ksp_monitor": None,
+        # }
         solver  = fd.NonlinearVariationalSolver(problem,
-                                                solver_parameters={
-                                                    "snes_type": "newtonls",
-                                                    "ksp_error_if_not_converged": True,
-                                                    "ksp_type": "gmres",
-                                                    "pc_type": "lu",
-                                                    # "snes_type": "newtonls",
-                                                    # "snes_linesearch_type": "bt",
-                                                    # "snes_linesearch_damping": 0.8,
-                                                    # "snes_max_it": 25,
-                                                    # "snes_rtol": 1e-8,
-                                                    # "snes_atol": 1e-10,
-                                                    # "snes_stol": 1e-12,
-                                                    # "ksp_type": "bcgs",
-                                                    # "pc_type": "jacobi",
-                                                },
+                                                solver_parameters=solver_parameters
                                                 )
         
-        # Access PETSc SNES
-        snes = solver.snes
+        # # Access PETSc SNES
+        # snes = solver.snes
 
-        def callback(snes, it, rnorm):
-            # This is called each nonlinear iteration
-            self.update_Q(Qnp1, Qaux_np1)
-            self.update_Qaux(Qnp1, Qaux_np1)
+        # def callback(snes, it, rnorm):
+        #     # This is called each nonlinear iteration
+        #     self.update_Q(Qnp1, Qaux_np1)
+        #     self.update_Qaux(Qnp1, Qaux_np1)
 
-        snes.setMonitor(callback)
+        # snes.setMonitor(callback)
         return solver
     
     def _build_problem(self, weak_form, Qnp1, with_jacobian: bool):
@@ -570,9 +621,20 @@ class FiredrakeHyperbolicSolver:
         newton.snes.setMonitor(cb)
 
         return newton
+    
+    def _get_functionspaces(self, mesh, runtime_model):
+        V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
+        Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
+        Qn = fd.Function(V)
+        Qs = fd.Function(V)
+        Qnp1 = fd.Function(V)
+        Qaux_n = fd.Function(Vaux)  
+        Qaux_s = fd.Function(Vaux)      
+        Qaux_np1 = fd.Function(Vaux)
 
     def solve(self, mshfile, model):
-        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index = self._setup(mshfile, model)
+        start_time = get_time()
+        mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index = self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
         
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
@@ -580,12 +642,13 @@ class FiredrakeHyperbolicSolver:
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
-        weak_form = self._get_weak_form(runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
         
-        # solver = self._get_solver(weak_form, Qnp1, Qaux)
-        solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_n)
-        solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_n)
+        wf_convective = self._get_weak_form_convective(runtime_model, Qn, Qs, Qaux_n, Qaux_s, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+        wf_source = self._get_weak_form_source(runtime_model, Qnp1, Qs, Qaux_np1, Qaux_s, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d, theta=1.0)
         
+        solver_convective = self._get_linear_solver(wf_convective, Qs, Qaux_s)
+        # solver_convective = self._get_nonlinear_solver(wf_convective, Qs, Qaux_s)
+        solver_source = self._get_nonlinear_solver(wf_source, Qnp1, Qaux_np1)
         
         main_dir = misc.get_main_directory()
         out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
@@ -598,24 +661,25 @@ class FiredrakeHyperbolicSolver:
         
         while sim_time < self.time_end:
             Qn.assign(Qnp1)
-            self.update_Q(Qn, Qaux_n)
-            self.update_Qaux(Qn, Qaux_n)
+            Qaux_n.assign(Qaux_np1)
             dt.assign(compute_dt(Qn, Qaux_n))
-            try:
-                solver_picard.solve()
-            except :
-                logger.info("Picard pre-solve exited with DTOL; continuing with Newton")
-            solver_newton.solve()
-            self.update_Q(Qnp1, Qaux_n)
+
+            solver_convective.solve()
+            self.update_Q(Qs, Qaux_s)
+            self.update_Qaux(Qs, Qaux_s)
+            solver_source.solve()
+            self.update_Q(Qnp1, Qaux_np1)
+            self.update_Qaux(Qnp1, Qaux_np1)
+            
             sim_time += float(dt)
             iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
                 next_write_time += dt_snapshot
-                self.write_state(Qnp1, Qaux_n, out, time=sim_time)
+                self.write_state(Qnp1, Qaux_np1, out, time=sim_time)
             if iteration % 10 == 0:
                 logger.info(
                     f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
                     f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
                         )
-                
-        logger.info(f"Finished simulation with in {sim_time:.3f} seconds")
+        execution_time = get_time() - start_time
+        logger.info(f"Finished simulation with in {execution_time:.3f} seconds")

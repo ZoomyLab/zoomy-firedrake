@@ -9,6 +9,7 @@ from mpi4py import MPI
 
 from attrs import field, define
 
+from time import time as get_time
 from zoomy_core.fvm.solver_numpy import Settings
 from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
@@ -26,12 +27,6 @@ from firedrake.projection import Projector
 from firedrake.petsc import PETSc
 
 
-# Optional: inspect adaptor options (mostly for debugging)
-opts = PETSc.Options()
-print("Available options containing 'adaptor':")
-for k in opts.getAll().keys():
-    if b"adaptor" in k:
-        print(k.decode())
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +348,8 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     # ------------------------------------------------------------------
 
     def solve(self, mshfile, model):
+        
+        start_time = get_time()
         # ----- 1. Setup -----
         mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index = \
             self._setup(mshfile, model)
@@ -362,10 +359,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
-        weak_form = self._get_weak_form(
-            runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh,
-            map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
-        )
 
         # ---- 2. Output setup ----
         main_dir = misc.get_main_directory()
@@ -391,18 +384,16 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         scaled.interpolate(1.0)
         metric.compute_isotropic_metric(scaled, interpolant="L2")
         mesh_complexity = metric.complexity()
-        print(f"Target mesh complexity for AMR: {mesh_complexity}")
 
-        solver = self._get_solver(weak_form, Qnp1, Qaux_np1)
-        solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_np1)
-        solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_np1)
+
+        weak_forms = self._register_weak_forms(runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
+        solvers = self._register_solvers(weak_forms, Qnp1, Qaux_n)
 
         while sim_time < self.time_end:
                         # 3b. AMR every `refine_every` iterations (up to max_refinements)
-            if (iteration % self.refine_every == 0):
+            if (iteration % self.refine_every == 0 and self.enable_amr):
                 logger.info(
-                    f"Refining at iteration {int(iteration)}, "
-                    f"sim_time {float(sim_time):.6f}"
+                    f"Refining at iteration {int(iteration)}"
                 )
 
                 old_num_cells = mesh.num_cells()
@@ -422,7 +413,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                     })
                     combined_metric.normalise()
                     refined_mesh = adapt(mesh, combined_metric)
-                    print(f"New mesh complexity for AMR: {metric.complexity()}")
                     mesh = refined_mesh
 
                     # Rebuild function spaces on new mesh
@@ -453,9 +443,8 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                         runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh,
                         map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
                     )
-                    solver = self._get_solver(weak_form, Qnp1, Qaux_np1)
-                    solver_picard = self._get_solver_picard(weak_form, Qnp1, Qaux_np1)
-                    solver_newton = self._get_solver_newton(weak_form, Qnp1, Qaux_np1)
+                    
+                    solvers = self._register_solvers(weak_forms, Qnp1, Qaux_n)
 
                 except Exception as e:
                     print("Mesh refinement failed:", e)
@@ -463,7 +452,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                     raise
 
                 new_num_cells = mesh.num_cells()
-                print(f"Mesh refined: {old_num_cells} → {new_num_cells} cells")
+                logger.info(""f"Mesh refined: {old_num_cells} → {new_num_cells} cells")
                 
             # 3b. Advance in time
             Qn.assign(Qnp1)
@@ -473,13 +462,8 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
             self.update_Qaux(Qnp1, Qaux_np1)
 
             dt.assign(compute_dt(Qn, Qaux_n))
-            solver.solve()
-            # try:
-            #     solver_picard.solve()
-            # except:
-            #     logger.info("Picard pre-solve exited with DTOL; continuing with Newton")
-            # solver_newton.solve()
-            # self.update_Q(Qnp1, Qaux_np1)
+            for solver in solvers:
+                solver.solve()
 
             sim_time += float(dt)
             iteration += 1
@@ -495,5 +479,5 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
             if sim_time + 1e-12 >= next_write_time:
                 self.write_state(Qnp1, Qaux_n, out, time=sim_time)
                 next_write_time += dt_snapshot
-
-        logger.info(f"Finished simulation in {sim_time:.3f} seconds")
+        execution_time = get_time() - start_time
+        logger.info(f"Finished simulation in {execution_time:.3f} seconds")
