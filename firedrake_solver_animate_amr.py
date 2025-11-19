@@ -300,7 +300,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     # ------------------------------------------------------------------
 
     def _prolong_vector_function(self, old_fun, new_space,
-                                 h_dry=1e-10, pos_idx=[1], clip=True):
+                                 h_dry=0, pos_idx=[1], clip=True):
         """
         Conservatively prolong vector field old_fun into new_space
         while enforcing positivity (e.g., for water height).
