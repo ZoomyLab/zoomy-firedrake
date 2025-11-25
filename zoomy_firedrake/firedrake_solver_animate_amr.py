@@ -19,9 +19,9 @@ import zoomy_firedrake.firedrake_solver as fd_solver
 
 from pyop2 import op2
 
-from firedrake_animate.animate.utility import VTKFile
-from firedrake_animate.animate.metric import RiemannianMetric, P0Metric
-from firedrake_animate.animate.adapt import adapt
+from firedrake_animate.utility import VTKFile
+from firedrake_animate.metric import RiemannianMetric, P0Metric
+from firedrake_animate.adapt import adapt
 
 from firedrake.projection import Projector
 from firedrake.petsc import PETSc
@@ -351,7 +351,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         
         start_time = get_time()
         # ----- 1. Setup -----
-        mesh, runtime_model, V, Vaux, Qn, Qnp1, Qaux_n, Qaux_np1, map_boundary_tag_to_function_index = \
+        mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index = \
             self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
 
