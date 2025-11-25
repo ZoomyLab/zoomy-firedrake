@@ -322,7 +322,7 @@ class FiredrakeHyperbolicSolver:
         runtime_model = UFLRuntimeModel(model)
 
 
-        Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = self._get_functionspaces(mesh, runtime_model)
+        V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = self._get_functionspaces(mesh, runtime_model)
 
         self.set_initial_condition(Qn, model)
         self.set_initial_condition(Qs, model)
@@ -631,6 +631,8 @@ class FiredrakeHyperbolicSolver:
         Qaux_n = fd.Function(Vaux)  
         Qaux_s = fd.Function(Vaux)      
         Qaux_np1 = fd.Function(Vaux)
+        
+        return V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1
 
     def solve(self, mshfile, model):
         start_time = get_time()
