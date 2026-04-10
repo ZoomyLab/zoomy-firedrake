@@ -51,7 +51,7 @@ class FiredrakeHyperbolicSolver:
     CFL: float = field(default=0.45)
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
-    limiter: str = field(default="vertex")  # "vertex" or "none"
+    limiter: str = field(default="vertex")  # "vertex", "p_weighted", or "none"
 
     # Nested struct with factory
     settings: Zstruct = field(factory=lambda: Settings.default())
@@ -601,10 +601,19 @@ class FiredrakeHyperbolicSolver:
     # ------------------------------------------------------------------
 
     def _apply_slope_limiter(self, Q):
-        """Apply Kuzmin-type vertex-based slope limiter for DG degree >= 1.
+        """Apply slope limiter for DG degree >= 1.
 
         For vector function spaces the limiter is applied component-wise
-        because Firedrake's VertexBasedLimiter operates on scalar spaces.
+        because both ``VertexBasedLimiter`` and ``PWeightedLimiter``
+        operate on scalar spaces.
+
+        Supported modes (set via ``self.limiter``):
+
+        - ``"vertex"``     -- Kuzmin-type vertex-based limiter (Firedrake built-in).
+        - ``"p_weighted"`` -- p-weighted limiter (Li et al. 2020).  Higher-order
+          modes are damped more aggressively, preserving accuracy at smooth
+          extrema while controlling oscillations at shocks.
+        - ``"none"``       -- no limiting.
         """
         if self.dg_degree < 1:
             return
@@ -617,7 +626,19 @@ class FiredrakeHyperbolicSolver:
 
         # Build a scalar DG space with the same degree for the limiter
         V_scalar = fd.FunctionSpace(mesh, "DG", self.dg_degree)
-        limiter = fd.VertexBasedLimiter(V_scalar)
+
+        if self.limiter == "p_weighted":
+            from zoomy_firedrake.p_weighted_limiter import PWeightedLimiter
+            # Cache the limiter on _state to avoid recomputing adjacency
+            s = self._state
+            if s is not None and hasattr(s, "_pw_limiter"):
+                limiter = s._pw_limiter
+            else:
+                limiter = PWeightedLimiter(V_scalar)
+                if s is not None:
+                    s._pw_limiter = limiter
+        else:
+            limiter = fd.VertexBasedLimiter(V_scalar)
 
         for i in range(ncomp):
             qi = fd.Function(V_scalar)
