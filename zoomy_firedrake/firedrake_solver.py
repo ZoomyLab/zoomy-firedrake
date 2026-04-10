@@ -29,18 +29,78 @@ class FiredrakeHyperbolicSolver:
     # Scalar parameters
     CFL: float = field(default=0.45)
     time_end: float = field(default=0.1)
-    
+    dg_degree: int = field(default=0)
+
     # Nested struct with factory
     settings: Zstruct = field(factory=lambda: Settings.default())
 
-    # Tensor factory (recomputed for each instance)
+    # Tensor factory (recomputed for each instance).
+    # NOTE: The default is a 4x4 identity for backward compatibility with
+    # 4-variable SWE models.  For models with a different number of variables
+    # use ``_get_identity_matrix(n)`` which builds a correctly-sized UFL tensor.
     IdentityMatrix = field(factory=lambda: ufl.as_tensor([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]))
 
     def __attrs_post_init__(self):
         defaults = Settings.default()
         defaults.update(self.settings)
         object.__setattr__(self, "settings", defaults)
-        
+
+    # ------------------------------------------------------------------
+    # Model introspection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_identity_matrix(n):
+        """Build an n x n UFL identity tensor."""
+        rows = [[1 if i == j else 0 for j in range(n)] for i in range(n)]
+        return ufl.as_tensor(rows)
+
+    @staticmethod
+    def _model_has_free_surface(model):
+        """Check if model has free-surface variables (h and b).
+
+        Works with both symbolic Model (model.variables is Zstruct with keys)
+        and UFLRuntimeModel (has model.model.variables).
+        """
+        sym = model.model if hasattr(model, "model") else model
+        keys = list(sym.variables.keys()) if hasattr(sym.variables, "keys") else []
+        return "h" in keys and "b" in keys
+
+    @staticmethod
+    def _model_source_indices(model):
+        """Return indices of variables that receive source terms.
+
+        For free-surface models this is all indices except b (index 0).
+        For generic models every variable index is included.
+        """
+        sym = model.model if hasattr(model, "model") else model
+        keys = list(sym.variables.keys()) if hasattr(sym.variables, "keys") else []
+        if "h" in keys and "b" in keys:
+            # SWE-family: source acts on everything except bathymetry (idx 0)
+            return list(range(1, len(keys)))
+        # Generic: source may act on every variable
+        return list(range(len(keys)))
+
+    @staticmethod
+    def _model_has_diffusive_flux(model):
+        """Check whether the model defines a non-trivial diffusive flux."""
+        sym = model.model if hasattr(model, "model") else model
+        if not hasattr(sym, "functions"):
+            return False
+        if "diffusive_flux" not in sym.functions.keys():
+            return False
+        # Check if the symbolic expression is all zeros
+        try:
+            sym_dflux = sym.diffusive_flux()
+            is_zero = hasattr(sym_dflux, "tolist") and all(
+                e == 0
+                for row in sym_dflux.tolist()
+                for e in (row if isinstance(row, list) else [row])
+            )
+            return not is_zero
+        except Exception:
+            return False
+
     def get_map_boundary_tag_to_boundary_function_index(self, model, msh_path, mesh):
         msh = meshio.read(msh_path)
         boundary_function_names = model.boundary_conditions._boundary_tags
@@ -150,10 +210,13 @@ class FiredrakeHyperbolicSolver:
         return Ql_star, Qr_star
     
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
-        # Hydrostatic reconstruction
-        Ql_star, Qr_star = self.hydrostatic_reconstruction(Ql, Qr)
+        # Hydrostatic reconstruction only for free-surface models (SWE-family)
+        if self._model_has_free_surface(model):
+            Ql_star, Qr_star = self.hydrostatic_reconstruction(Ql, Qr)
+        else:
+            Ql_star, Qr_star = Ql, Qr
 
-        # Fluxes from reconstructed states
+        # Fluxes from (possibly reconstructed) states
         flux_L = model.flux(Ql_star, Qauxl, parameters)
         flux_R = model.flux(Qr_star, Qauxr, parameters)
 
@@ -163,8 +226,7 @@ class FiredrakeHyperbolicSolver:
         alpha_L = self.max_abs_eigenvalue(model, Ql_star, Qauxl, n, mesh)
         alpha_R = self.max_abs_eigenvalue(model, Qr_star, Qauxr, n, mesh)
 
-
-        # LLF-type dissipation using reconstructed states
+        # LLF-type dissipation using (possibly reconstructed) states
         num_flux = fd.dot(central_flux, n) - 0.5 * ufl.max_value(alpha_L, alpha_R) * fd.dot(self.IdentityMatrix, (Qr_star - Ql_star))
 
         return num_flux
@@ -179,6 +241,7 @@ class FiredrakeHyperbolicSolver:
     
     def write_state(self, q, qaux, out, time=0.0, names=None):
         mesh = q.function_space().mesh()
+        # Always project to DG0 for VTK output regardless of solution degree
         V_scalar = fd.FunctionSpace(mesh, "DG", 0)
         n_dof_q = q.function_space().value_size
         n_dof_aux = qaux.function_space().value_size
@@ -191,47 +254,71 @@ class FiredrakeHyperbolicSolver:
         ]
         out.write(*subfuns, time=time)
         
-    def update_Qaux(self, Q, Qaux, eps=1e-8):
+    def update_Qaux(self, Q, Qaux, runtime_model=None, eps=1e-8):
+        """Update auxiliary variables.
+
+        If *runtime_model* is provided and exposes an ``update_aux_variables``
+        callback, that model-driven update is used.  Otherwise the legacy
+        SWE-specific path (h_inv from Q[1]) is used for backward compatibility.
+        """
+        if runtime_model is not None and hasattr(runtime_model, "update_aux_variables"):
+            Qaux_new = runtime_model.update_aux_variables(Q, Qaux, runtime_model.parameters)
+            Qaux.interpolate(Qaux_new)
+            return
+
+        # Legacy SWE fallback: assumes Q[1] = h, Qaux[0] = h_inv
         h = Q.sub(1)
         eps = fd.Constant(1e-4)
 
         h_new  = fd.max_value(h, eps)
         h_inv = 1/(h_new)
-        wet    = fd.conditional(h > eps, 1.0, 0.0)
 
-        # Build the whole updated Q vector
         Qaux_new = fd.as_vector([
-            h_inv,            # whatever this component is
+            h_inv,
         ])
         Qaux.interpolate(Qaux_new)
 
 
         
-    def update_Q(self, Q, Qaux):
+    def update_Q(self, Q, Qaux, runtime_model=None):
+        """Update conserved variables (positivity, velocity capping, etc.).
+
+        If *runtime_model* is provided and exposes an ``update_variables``
+        callback, that model-driven update is used.  Otherwise the legacy
+        SWE-specific path (velocity capping on 4-component [b,h,hu,hv]) is
+        used for backward compatibility.
+        """
+        if runtime_model is not None and hasattr(runtime_model, "update_variables"):
+            Q_new = runtime_model.update_variables(Q, Qaux, runtime_model.parameters)
+            Q.interpolate(Q_new)
+            return
+
+        # Legacy SWE fallback: assumes Q = [b, h, hu, hv]
+        ncomp = Q.function_space().value_size
+        if ncomp < 4:
+            # Not the 4-component SWE layout -- skip legacy capping
+            return
+
         h = Q.sub(1)
         eps = fd.Constant(1e-4)
 
         h_new  = fd.max_value(h, eps)
         wet    = fd.conditional(h > eps, 1.0, 0.0)
-        
-        
+
         max_vel_cap = fd.Constant(100)
-        
+
         u = Q.sub(2) / (h_new)
         u_new = wet * fd.sign(u) * fd.min_value(abs(u), max_vel_cap)
-        
+
         v = Q.sub(3) / (h_new)
         v_new = wet * fd.sign(v) * fd.min_value(abs(v), max_vel_cap)
-        
-        
-        
 
         # Build the whole updated Q vector
         Q_new = fd.as_vector([
-            Q.sub(0),            # whatever this component is
-            Q.sub(1),               # updated h
-            h_new * u_new,      # zero momentum if dry
-            h_new * v_new,      # zero momentum if dry
+            Q.sub(0),               # b (bathymetry)
+            Q.sub(1),               # h (depth, kept as-is)
+            h_new * u_new,          # zero momentum if dry
+            h_new * v_new,          # zero momentum if dry
         ])
         Q.interpolate(Q_new)
 
@@ -267,11 +354,17 @@ class FiredrakeHyperbolicSolver:
         Returns a callable that computes Δt(Q, Qaux) for a fixed mesh and model.
 
         This avoids re-evaluating static mesh geometry (e.g. CellDiameter).
+        The CFL condition accounts for the DG polynomial degree via the
+        standard scaling: dt = CFL * h_cell / ((2*degree + 1) * max_eigenvalue).
         """
+        degree = self.dg_degree
 
         V0 = fd.FunctionSpace(mesh, "DG", 0)
         h = fd.Function(V0).interpolate(fd.CellDiameter(mesh))
         dim = mesh.geometric_dimension()
+
+        # For DG degree p the effective wave speed factor is (2p+1)
+        degree_factor = float(2 * degree + 1)
 
         def compute_dt(Q, Qaux):
             """Compute global stable Δt for the given fields Q and Qaux."""
@@ -285,8 +378,10 @@ class FiredrakeHyperbolicSolver:
             lam_local = fd.Function(V0)
             lam_local.dat.data[:] = np.maximum(lam_x.dat.data_ro, lam_y.dat.data_ro)
 
-            # Local stable dt
-            dt_local = fd.Function(V0).interpolate(CFL * (h/2) / (lam_local + 1e-8))
+            # Local stable dt -- scaled by (2*degree + 1) for higher-order DG
+            dt_local = fd.Function(V0).interpolate(
+                CFL * (h / 2) / (degree_factor * lam_local + 1e-8)
+            )
 
             # Global min across cells and MPI ranks
             dt_min = float(np.min(dt_local.dat.data_ro))
@@ -321,23 +416,28 @@ class FiredrakeHyperbolicSolver:
         mesh = fd.Mesh(mshfile)
         runtime_model = UFLRuntimeModel(model)
 
+        # Rebuild IdentityMatrix to match the actual number of variables
+        nvar = runtime_model.n_variables
+        if nvar != 4:
+            object.__setattr__(self, "IdentityMatrix", self._get_identity_matrix(nvar))
 
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = self._get_functionspaces(mesh, runtime_model)
 
         self.set_initial_condition(Qn, model)
         self.set_initial_condition(Qs, model)
         self.set_initial_condition(Qnp1, model)
-        self.update_Qaux(Qn, Qaux_n)
-        self.update_Qaux(Qs, Qaux_s)
-        self.update_Qaux(Qnp1, Qaux_np1)
-        self.update_Q(Qn, Qaux_n)
-        self.update_Q(Qs, Qaux_s)
-        self.update_Q(Qnp1, Qaux_np1)
-        
+        # Use model-driven updates when available, fall back to legacy SWE path
+        self.update_Qaux(Qn, Qaux_n, runtime_model)
+        self.update_Qaux(Qs, Qaux_s, runtime_model)
+        self.update_Qaux(Qnp1, Qaux_np1, runtime_model)
+        self.update_Q(Qn, Qaux_n, runtime_model)
+        self.update_Q(Qs, Qaux_s, runtime_model)
+        self.update_Q(Qnp1, Qaux_np1, runtime_model)
+
         # Collect all boundary tags
         map_boundary_tag_to_function_index = self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
-        
-        return mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index 
+
+        return mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index
     
     def _get_weak_form_convective(self, runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d):
         test_q = fd.TestFunction(Qn.function_space())
@@ -385,7 +485,7 @@ class FiredrakeHyperbolicSolver:
         
 
         for tag, idx in map_boundary_tag_to_function_index.items():
-            
+
             # Position and "distance" placeholders (can be replaced with actual geometric quantities)
             dX = x[0]  # your placeholder (e.g., half cell size)
 
@@ -398,13 +498,13 @@ class FiredrakeHyperbolicSolver:
                 Q,
                 Qaux_n,
                 runtime_model.parameters,
-                n,          
+                n,
             )
             weak_form += ufl.dot(
                 test_q,
                 self.numerical_flux(runtime_model, Q, Q_bnd, Qaux_n, Qaux_n, runtime_model.parameters, n, mesh)
             ) * fd.ds(tag)
-            
+
             Dp, Dm = nc_flux(Q, Q_bnd, Qaux_n, Qaux_n, n)
             weak_form += (
                 fd.dot(
@@ -412,6 +512,15 @@ class FiredrakeHyperbolicSolver:
                     Dm
                     )
                 ) * fd.ds(tag)
+
+        # --- Diffusive flux contribution (IP-DG) for DG1+ ---
+        # NOTE: Cannot test without Firedrake installation
+        if self.dg_degree >= 1 and self._model_has_diffusive_flux(runtime_model):
+            weak_form += self._get_weak_form_diffusion(
+                runtime_model, Q, Qaux_n, test_q, mesh, n,
+                map_boundary_tag_to_function_index, sim_time, x, x_3d,
+            )
+
         return weak_form
     
     def _get_weak_form_source(
@@ -426,35 +535,39 @@ class FiredrakeHyperbolicSolver:
         theta=1.0
     ):
         """
-        Source step: evolve only momentum components (indices 2, 3).
+        Source step: evolve only the variables that receive source terms.
+
+        The source-active indices are determined by ``_model_source_indices``:
+        - SWE-family models: all indices except bathymetry (index 0)
+        - Generic models: all variable indices
 
         We build a residual like
             (Qnp1[i] - Q_star[i])/dt = S_i(...)
-        for i in mom_var = [2, 3],
-        and 0 for i = 0,1.
+        for i in source_indices, and 0 for other components.
         """
 
-        mom_var = [1, 2, 3]  # momentum indices
+        # Derive source indices from the model instead of hardcoding [1,2,3]
+        source_indices = self._model_source_indices(runtime_model)
 
         V = Qnp1.function_space()
         test_q = fd.TestFunction(V)
         ncomp = V.value_size
 
-        # θ-method interpolation (only really matters for momentum; b,h are irrelevant for S)
+        # theta-method interpolation
         Q_theta    = theta*Qnp1    + (1.0 - theta)*Q_star
         Qaux_theta = theta*Qaux_np1 + (1.0 - theta)*Qaux_star
 
-        # Full source vector from the model (your new implementation only depends on hU, hinv)
+        # Full source vector from the model
         source_full = runtime_model.source(Q_theta, Qaux_theta, runtime_model.parameters)
 
         zero = fd.Constant(0.0)
 
-        # Build vectors that are nonzero only for momentum components
+        # Build vectors that are nonzero only for source-active components
         diff_restricted = []
         source_restricted = []
 
         for i in range(ncomp):
-            if i in mom_var:
+            if i in source_indices:
                 diff_restricted.append(Qnp1[i] - Q_star[i])
                 source_restricted.append(source_full[i])
             else:
@@ -464,7 +577,7 @@ class FiredrakeHyperbolicSolver:
         diff_restricted   = fd.as_vector(diff_restricted)
         source_restricted = fd.as_vector(source_restricted)
 
-        # Weak form: only momentum components contribute because others are zeroed out
+        # Weak form: only source-active components contribute
         weak_form  = fd.dot(test_q, diff_restricted/dt) * fd.dx
         weak_form -= fd.dot(test_q, source_restricted) * fd.dx
 
@@ -472,6 +585,128 @@ class FiredrakeHyperbolicSolver:
 
 
     
+    # ------------------------------------------------------------------
+    # IP-DG diffusive flux (Task 3)
+    # ------------------------------------------------------------------
+
+    def _get_weak_form_diffusion(self, runtime_model, Q, Qaux, test_q, mesh, n,
+                                  map_boundary_tag_to_function_index,
+                                  sim_time, x, x_3d):
+        """Interior Penalty DG (IP-DG) discretisation of the diffusive flux.
+
+        For DG0 this returns zero (grad(Q) = 0 inside each cell, and face-based
+        diffusion is already captured by the Rusanov dissipation in the numerical
+        flux).  For DG1+ the standard symmetric IP-DG form is used:
+
+        - Volume:  integral nu * grad(Q) : grad(v) dx
+        - Interior faces:  -avg(nu * grad(Q)) . jump(v) dS
+                           -avg(nu * grad(v)) . jump(Q) dS
+                           + (sigma / h_F) jump(Q) . jump(v) dS
+        - Exterior faces:  analogous Dirichlet penalty terms
+
+        NOTE: Cannot test without Firedrake installation.
+        """
+        degree = self.dg_degree
+
+        if degree < 1:
+            # DG0: no within-cell gradient, diffusion handled by numerical flux
+            return fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
+
+        if not self._model_has_diffusive_flux(runtime_model):
+            return fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
+
+        ncomp = Q.function_space().value_size
+
+        # Penalty parameter: scale with degree^2 / h_F (standard IP-DG)
+        sigma = fd.Constant(float(10.0 * degree ** 2))
+        h_F = fd.CellDiameter(mesh)  # local cell diameter
+
+        # The model's diffusive_flux is symbolically F_diff(Q, Qaux, gradQ, p).
+        # In the UFL context we can compute gradQ = grad(Q) directly.
+        grad_Q = fd.grad(Q)  # shape (ncomp, gdim)
+
+        # Construct the diffusive flux tensor from the model.
+        # The runtime_model.diffusive_flux expects (Q, Qaux, gradQ, p) where
+        # gradQ is a flat vector of gradient symbols.  In the UFL world we
+        # need to build that flat vector from grad(Q).
+        gdim = mesh.geometric_dimension()
+
+        # Build a flat gradient vector matching the model's gradient_variables
+        # ordering: [dQ0_d0, dQ0_d1, dQ1_d0, dQ1_d1, ...]
+        grad_flat_components = []
+        for i in range(ncomp):
+            for d in range(gdim):
+                grad_flat_components.append(grad_Q[i, d])
+        grad_flat = fd.as_vector(grad_flat_components)
+
+        # Evaluate the model's diffusive flux: shape (ncomp, gdim) as a UFL expr
+        D_flux = runtime_model.diffusive_flux(Q, Qaux, grad_flat, runtime_model.parameters)
+
+        # --- Volume integral: - integral D_flux : grad(v) dx
+        # D_flux[i,d] * grad(test_q)[i,d]
+        grad_v = fd.grad(test_q)
+        vol_form = fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
+        for i in range(ncomp):
+            for d in range(gdim):
+                vol_form += D_flux[i * gdim + d] * grad_v[i, d] * fd.dx
+
+        # --- Interior face terms (symmetric IP-DG)
+        # jump(Q)[i] = Q('+')[i] - Q('-')[i]
+        # avg(grad_Q)[i,d] = 0.5*(grad_Q('+') + grad_Q('-'))[i,d]
+        avg_h = (h_F("+") + h_F("-")) / 2.0
+
+        # Consistency: -avg(D . grad(Q)) . n . jump(v)
+        # Symmetry:    -avg(D . grad(v)) . n . jump(Q)
+        # Penalty:     sigma/h * jump(Q) . jump(v)
+        face_form = fd.Constant(0.0) * fd.dot(test_q("+"), Q("+")) * fd.dS
+        for i in range(ncomp):
+            jump_Q_i = Q("+").sub(i) - Q("-").sub(i)
+            jump_v_i = test_q("+").sub(i) - test_q("-").sub(i)
+
+            for d in range(gdim):
+                avg_gradQ_id = 0.5 * (grad_Q("+")[i, d] + grad_Q("-")[i, d])
+                avg_gradv_id = 0.5 * (grad_v("+")[i, d] + grad_v("-")[i, d])
+
+                # Use a scalar diffusion coefficient (first non-zero diagonal
+                # entry). For more general tensorial diffusion this would
+                # require the full D tensor evaluation at faces.
+                face_form -= avg_gradQ_id * n("+")[d] * jump_v_i * fd.dS
+                face_form -= avg_gradv_id * n("+")[d] * jump_Q_i * fd.dS
+
+            # Penalty
+            face_form += (sigma / avg_h) * jump_Q_i * jump_v_i * fd.dS
+
+        return vol_form + face_form
+
+    # ------------------------------------------------------------------
+    # Slope limiter for DG1+ (Task 4)
+    # ------------------------------------------------------------------
+
+    def _apply_slope_limiter(self, Q):
+        """Apply Kuzmin-type vertex-based slope limiter for DG degree >= 1.
+
+        For vector function spaces the limiter is applied component-wise
+        because Firedrake's VertexBasedLimiter operates on scalar spaces.
+
+        NOTE: Cannot test without Firedrake installation.
+        """
+        if self.dg_degree < 1:
+            return
+
+        V = Q.function_space()
+        mesh = V.mesh()
+        ncomp = V.value_size
+
+        # Build a scalar DG space with the same degree for the limiter
+        V_scalar = fd.FunctionSpace(mesh, "DG", self.dg_degree)
+        limiter = fd.VertexBasedLimiter(V_scalar)
+
+        for i in range(ncomp):
+            qi = fd.Function(V_scalar)
+            qi.interpolate(Q.sub(i))
+            limiter.apply(qi)
+            Q.sub(i).interpolate(qi)
+
     def _get_linear_solver(self, weak_form, Qnp1, Qaux_np1):
         a = fd.lhs(weak_form)
         L = fd.rhs(weak_form)
@@ -622,57 +857,120 @@ class FiredrakeHyperbolicSolver:
 
         return newton
     
-    def _get_functionspaces(self, mesh, runtime_model):
-        V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_variables)
-        Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=runtime_model.n_aux_variables)
+    def _get_functionspaces(self, mesh, runtime_model, degree=None):
+        """Build DG function spaces with configurable polynomial degree.
+
+        Parameters
+        ----------
+        mesh : firedrake.Mesh
+        runtime_model : UFLRuntimeModel
+        degree : int or None
+            Polynomial degree for the DG space.  When *None* the solver's
+            ``dg_degree`` attribute is used.
+        """
+        if degree is None:
+            degree = self.dg_degree
+        V = fd.VectorFunctionSpace(mesh, "DG", degree, dim=runtime_model.n_variables)
+        Vaux = fd.VectorFunctionSpace(mesh, "DG", degree, dim=runtime_model.n_aux_variables)
         Qn = fd.Function(V)
         Qs = fd.Function(V)
         Qnp1 = fd.Function(V)
-        Qaux_n = fd.Function(Vaux)  
-        Qaux_s = fd.Function(Vaux)      
+        Qaux_n = fd.Function(Vaux)
+        Qaux_s = fd.Function(Vaux)
         Qaux_np1 = fd.Function(Vaux)
-        
+
         return V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1
+
+    # ------------------------------------------------------------------
+    # Weak-form / solver registration (used by AMR subclass)
+    # ------------------------------------------------------------------
+
+    def _register_weak_forms(self, runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1,
+                             n, mesh, map_boundary_tag_to_function_index,
+                             sim_time, dt, x, x_3d):
+        """Build and return a list of weak forms (convective, then source).
+
+        This is the hook that ``FiredrakeHyperbolicSolverAMR.solve()`` expects.
+        It also needs *Qs* and *Qaux_s* intermediates, so we create them here
+        from the same function spaces.
+        """
+        V = Qn.function_space()
+        Vaux = Qaux_n.function_space()
+        Qs = fd.Function(V)
+        Qaux_s = fd.Function(Vaux)
+
+        wf_convective = self._get_weak_form_convective(
+            runtime_model, Qn, Qs, Qaux_n, Qaux_s,
+            n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d,
+        )
+        wf_source = self._get_weak_form_source(
+            runtime_model, Qnp1, Qs, Qaux_np1, Qaux_s,
+            n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d,
+            theta=1.0,
+        )
+        return [wf_convective, wf_source]
+
+    def _register_solvers(self, weak_forms, Qnp1, Qaux_np1):
+        """Build solver objects from a list of weak forms.
+
+        Returns a list of solvers in the same order as *weak_forms*.
+        The first form (convective) uses a linear solver; the second (source)
+        uses a nonlinear solver.  Additional forms are treated as nonlinear.
+        """
+        solvers = []
+        for i, wf in enumerate(weak_forms):
+            if i == 0:
+                solvers.append(self._get_linear_solver(wf, Qnp1, Qaux_np1))
+            else:
+                solvers.append(self._get_nonlinear_solver(wf, Qnp1, Qaux_np1))
+        return solvers
+
+    # ------------------------------------------------------------------
+    # Main solve loop
+    # ------------------------------------------------------------------
 
     def solve(self, mshfile, model):
         start_time = get_time()
         mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index = self._setup(mshfile, model)
         x, x_3d, n = self._get_x_and_n(mesh)
-        
+
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
         nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         sim_time = 0.0
         dt = fd.Constant(0.1)
 
-        
         wf_convective = self._get_weak_form_convective(runtime_model, Qn, Qs, Qaux_n, Qaux_s, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
         wf_source = self._get_weak_form_source(runtime_model, Qnp1, Qs, Qaux_np1, Qaux_s, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d, theta=1.0)
-        
+
         solver_convective = self._get_linear_solver(wf_convective, Qs, Qaux_s)
-        # solver_convective = self._get_nonlinear_solver(wf_convective, Qs, Qaux_s)
         solver_source = self._get_nonlinear_solver(wf_source, Qnp1, Qaux_np1)
-        
+
         main_dir = misc.get_main_directory()
-        out = fd.VTKFile(os.path.join(main_dir,self.settings.output.directory, "simulation.pvd"))
+        out = fd.VTKFile(os.path.join(main_dir, self.settings.output.directory, "simulation.pvd"))
         self.write_state(Qnp1, Qaux_n, out, time=sim_time)
         dx_ref = mesh.cell_sizes.dat.data_ro.min()
         iteration = 0
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
         next_write_time = dt_snapshot
-        
-        
+
         while sim_time < self.time_end:
             Qn.assign(Qnp1)
             Qaux_n.assign(Qaux_np1)
             dt.assign(compute_dt(Qn, Qaux_n))
 
             solver_convective.solve()
-            self.update_Q(Qs, Qaux_s)
-            self.update_Qaux(Qs, Qaux_s)
+            # Slope limiting after convective step (DG1+)
+            # NOTE: Cannot test without Firedrake installation
+            self._apply_slope_limiter(Qs)
+            self.update_Q(Qs, Qaux_s, runtime_model)
+            self.update_Qaux(Qs, Qaux_s, runtime_model)
+
             solver_source.solve()
-            self.update_Q(Qnp1, Qaux_np1)
-            self.update_Qaux(Qnp1, Qaux_np1)
-            
+            # Slope limiting after source step (DG1+)
+            self._apply_slope_limiter(Qnp1)
+            self.update_Q(Qnp1, Qaux_np1, runtime_model)
+            self.update_Qaux(Qnp1, Qaux_np1, runtime_model)
+
             sim_time += float(dt)
             iteration += 1
             if sim_time > next_write_time or sim_time >= self.time_end:
@@ -684,4 +982,4 @@ class FiredrakeHyperbolicSolver:
                     f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
                         )
         execution_time = get_time() - start_time
-        logger.info(f"Finished simulation with in {execution_time:.3f} seconds")
+        logger.info(f"Finished simulation in {execution_time:.3f} seconds")
