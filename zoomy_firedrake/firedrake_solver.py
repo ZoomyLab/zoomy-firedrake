@@ -1,10 +1,13 @@
 import firedrake as fd
 from firedrake.functionspaceimpl import MixedFunctionSpace
 import ufl
+import sympy as sp
 from zoomy_core.fvm.solver_numpy import Settings
 from attrs import field, define
 from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
+from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.fvm.riemann_solvers import Rusanov
 import numpy as np
 from mpi4py import MPI
 
@@ -32,9 +35,11 @@ class FiredrakeHyperbolicSolver:
     for any conservation law: scalar advection, advection-diffusion,
     user-defined systems, etc.
 
-    For free-surface flows (SWE, SME, VAM) use
-    :class:`FiredrakeFreeSurfaceSolver` which adds hydrostatic
-    reconstruction, wet/dry handling, and velocity capping.
+    Free-surface specifics (well-balancing, wet/dry, velocity capping)
+    are no longer the solver's concern — the symbolic Riemann solver
+    (e.g. :class:`PositiveRusanov`) and the SystemModel's
+    ``update_variables`` slot carry them.  Pick the appropriate
+    Riemann variant via ``riemann_solver_cls``.
 
     Workflow::
 
@@ -48,10 +53,14 @@ class FiredrakeHyperbolicSolver:
     """
 
     # --- Solver parameters ---
-    CFL: float = field(default=0.45)
+    CFL: float = field(default=0.9)
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
     limiter: str = field(default="vertex")  # "vertex", "p_weighted", or "none"
+    # Symbolic Riemann solver class — must accept a SystemModel and
+    # expose ``to_runtime_ufl()``.  Defaults to :class:`Rusanov`.
+    # Swap to ``HLL`` / ``HLLC`` / ``PositiveRusanov`` for wet/dry.
+    riemann_solver_cls: type = field(default=Rusanov)
 
     # Nested struct with factory
     settings: Zstruct = field(factory=lambda: Settings.default())
@@ -103,22 +112,31 @@ class FiredrakeHyperbolicSolver:
         return list(range(len(keys)))
 
     @staticmethod
-    def _model_has_diffusive_flux(model):
-        """Check whether the model defines a non-trivial diffusive flux."""
-        sym = model.model if hasattr(model, "model") else model
-        if not hasattr(sym, "functions"):
+    def _slot_is_nonzero(system_model, slot_name):
+        """Check whether ``SystemModel.<slot_name>`` carries a
+        non-trivial expression at the **active** parameter values.
+
+        Walks every entry of the slot's symbolic tensor and substitutes
+        the SystemModel's numeric ``parameter_values``.  Returns
+        ``False`` when the slot is ``None`` or every entry collapses to
+        zero once parameters are baked in (e.g. ``ν · h`` with ``ν = 0``
+        — symbolically non-zero but numerically off).  This matters
+        because the UFL lambdification path simplifies ``0 · h`` to
+        ``0`` at code-gen time, losing the mesh reference and breaking
+        ``form * dx`` with a "missing integration domain" error.
+        """
+        T = getattr(system_model, slot_name, None)
+        if T is None:
             return False
-        if "diffusive_flux" not in sym.functions.keys():
-            return False
-        # Check if the symbolic expression is all zeros
         try:
-            sym_dflux = sym.diffusive_flux()
-            is_zero = hasattr(sym_dflux, "tolist") and all(
-                e == 0
-                for row in sym_dflux.tolist()
-                for e in (row if isinstance(row, list) else [row])
+            params = system_model.parameters
+            values = system_model.parameter_values
+            sub_map = {params[k]: float(getattr(values, k, 0.0))
+                       for k in params.keys()}
+            return not all(
+                sp.simplify(sp.sympify(e).xreplace(sub_map)) == 0
+                for e in sp.flatten(T)
             )
-            return not is_zero
         except Exception:
             return False
 
@@ -142,6 +160,19 @@ class FiredrakeHyperbolicSolver:
 
         # 1. Make a list of (name, id)
         name_id_pairs = [(name, data[0]) for name, data in field_data.items()]
+
+        if not name_id_pairs:
+            # Mesh has no named physical boundary groups at all — fall
+            # back to applying the first declared BC over the entire
+            # exterior (every unmarked facet).  Without this fallback
+            # the BC loop is silently empty: no boundary flux enters
+            # the weak form, and conservation laws can leak mass /
+            # momentum freely through ∂Ω.  The sentinel ``"__all__"``
+            # is interpreted in the weak-form builder as ``fd.ds``
+            # (no subdomain_id).
+            if model.boundary_conditions._boundary_tags:
+                return {"__all__": 0}
+            return {}
 
         # 2. Sort alphabetically by name
         name_id_pairs.sort(key=lambda x: x[0])
@@ -173,16 +204,49 @@ class FiredrakeHyperbolicSolver:
     # ==================================================================
 
     def get_nonconservative_flux(self, model, parameters, mesh):
+        # The NCP path-integral contributes ``½(A ± λI)·[Q]`` where
+        # ``A = Σ_d (∫₀¹ B_d(Q(τ)) dτ) · n_d`` and ``B`` is the rank-3
+        # ``nonconservative_matrix``.  The Model-based UFL emitter
+        # collapses rank-3 ``NDimArray`` to a ``(n_eq², n_dim)`` flat
+        # matrix on lambdify, so we cannot just call ``fd.dot`` and add
+        # an ``(n_eq, n_eq)`` identity.  Instead we lambdify ``B``
+        # slab-by-slab over the dim axis (each slab is a proper
+        # ``(n_eq, n_eq)`` Matrix) and contract with the normal in UFL.
+        sm = self._state.system_model
+        ncp_is_zero = all(sp.simplify(e) == 0
+                          for e in sp.flatten(sm.nonconservative_matrix))
+        if ncp_is_zero:
+            nvar = sm.n_equations
+            zero_vec = fd.as_vector([fd.Constant(0.0)] * nvar)
+
+            def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
+                return zero_vec, zero_vec
+            return nc_flux
+
+        n_eq = sm.n_equations
+        n_dim = sm.n_dim
+        ncp_slab_fns = self._build_ncp_slab_fns(sm)
+
         samples, weights = np.polynomial.legendre.leggauss(3)
-        samples = fd.as_vector((samples + 1) / 2)
-        weights = fd.as_vector(weights * 0.5)
+        sample_pts = [(samples[k] + 1) / 2 for k in range(len(samples))]
+        sample_wts = [0.5 * weights[k] for k in range(len(weights))]
+
+        def _ncp_path_avg(Q_path, Qaux_path):
+            """``(n_eq, n_eq, n_dim)`` UFL tensor of the per-dim NCP
+            slabs, averaged over the path integration sample points."""
+            slabs = [
+                sum(w * fn(Q_path(xi), Qaux_path(xi), parameters)
+                    for xi, w in zip(sample_pts, sample_wts))
+                for fn in ncp_slab_fns
+            ]
+            return slabs  # list of n_dim (n_eq, n_eq) UFL tensors
 
         def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
-            A = fd.dot(sum(wi * model.nonconservative_matrix(
-                    Ql + xi * (Qr - Ql),
-                    Qauxl + xi * (Qauxr - Qauxl),
-                    parameters
-                ) for xi, wi in zip(samples, weights)), n)
+            def Q_path(xi): return Ql + xi * (Qr - Ql)
+            def Qaux_path(xi): return Qauxl + xi * (Qauxr - Qauxl)
+            slabs = _ncp_path_avg(Q_path, Qaux_path)
+            # A = Σ_d slab_d · n_d  ->  (n_eq, n_eq) UFL tensor
+            A = sum(slabs[d] * n[d] for d in range(n_dim))
             lam_l = self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh)
             lam_r = self.max_abs_eigenvalue(model, Qr, Qauxr, n, mesh)
             lam = ufl.max_value(lam_l, lam_r)
@@ -193,36 +257,64 @@ class FiredrakeHyperbolicSolver:
             return Dp, Dm
         return nc_flux
 
-    def _reconstruct_states(self, Ql, Qr):
-        """Reconstruct interface states for the numerical flux.
-
-        The generic solver performs no reconstruction -- states are passed
-        through unchanged.  Free-surface subclasses override this to apply
-        hydrostatic reconstruction.
+    def _build_ncp_slab_fns(self, sm):
+        """Lambdify ``sm.nonconservative_matrix`` per dim slab as a
+        proper ``(n_eq, n_eq)`` Matrix-valued callable taking
+        ``(Q, Qaux, p)`` — UFL-emittable.  Used by the path-integral
+        NCP fluctuation builder so the rank-3 tensor never collapses
+        to a flat ``(n_eq², n_dim)`` matrix in lambdification.
         """
-        return Ql, Qr
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.basefunction import Function
+        runtime_model = self._state.runtime_model if hasattr(
+            self._state, "runtime_model") else None
+        if runtime_model is None:
+            # ``_state.runtime_model`` is set in setup_simulation
+            # before _get_weak_form_convective is called; in the legacy
+            # _setup path it is supplied via closure.  Falling back to
+            # the SystemModel-driven UFL runtime would also work but
+            # the Model-based one is the validated path.
+            raise RuntimeError(
+                "runtime_model not on _state yet — _build_ncp_slab_fns "
+                "must be called after setup_simulation has built the "
+                "UFL runtime."
+            )
+
+        std_sig = Zstruct(
+            variables=sm.variables,
+            aux_variables=sm.aux_variables,
+            parameters=sm.parameters,
+        )
+        n_eq = sm.n_equations
+        n_dim = sm.n_dim
+        slab_fns = []
+        for d in range(n_dim):
+            slab = sp.Matrix(
+                n_eq, n_eq,
+                lambda i, j, _d=d: sm.nonconservative_matrix[i, j, _d],
+            )
+            fn = Function(name=f"nonconservative_matrix__d{d}",
+                          args=std_sig, definition=slab)
+            slab_fns.append(
+                runtime_model._lambdify_function(fn, [runtime_model.module])
+            )
+        return slab_fns
 
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
-        Ql_star, Qr_star = self._reconstruct_states(Ql, Qr)
+        """Apply the symbolic Riemann solver lowered to UFL.
 
-        # Fluxes from (possibly reconstructed) states
-        flux_L = model.flux(Ql_star, Qauxl, parameters)
-        flux_R = model.flux(Qr_star, Qauxr, parameters)
-
-        central_flux = 0.5 * (flux_L + flux_R)
-
-        # Wave speed (can still use original states for a robust bound)
-        alpha_L = self.max_abs_eigenvalue(model, Ql_star, Qauxl, n, mesh)
-        alpha_R = self.max_abs_eigenvalue(model, Qr_star, Qauxr, n, mesh)
-
-        # LLF-type dissipation using (possibly reconstructed) states
-        num_flux = (
-            fd.dot(central_flux, n)
-            - 0.5 * ufl.max_value(alpha_L, alpha_R)
-            * fd.dot(self.IdentityMatrix, (Qr_star - Ql_star))
-        )
-
-        return num_flux
+        ``self._state.runtime_numerics`` is the
+        :class:`UFLRuntimeSymbolic` produced by
+        ``self.riemann_solver_cls(SystemModel.from_model(model)).to_runtime_ufl()``
+        in :meth:`setup_simulation`; its ``numerical_flux`` callable
+        takes the face-side states + normals and returns the
+        numerical-flux UFL vector.  This routes every well-balancing /
+        wet-dry / structure-specific logic (handled symbolically inside
+        the Riemann solver via :class:`FieldHandle`) into the same code
+        path — no Firedrake-side reconstruction is needed.
+        """
+        rn = self._state.runtime_numerics
+        return rn.numerical_flux(Ql, Qr, Qauxl, Qauxr, parameters, n)
 
     def max_abs_eigenvalue(self, model, Q, Qaux, n, mesh):
         ev = model.eigenvalues(Q, Qaux, model.parameters, n)
@@ -300,40 +392,64 @@ class FiredrakeHyperbolicSolver:
         assert coords.shape[1] == dim, f"Unexpected coordinate shape {coords.shape}, dim={dim}"
         return coords
 
-    def get_compute_dt(self, mesh, model, CFL=0.45):
-        """Return a callable that computes dt(Q, Qaux) for a fixed mesh and model.
+    def get_compute_dt(self, mesh, model, CFL=0.9):
+        """Return a callable that computes ``dt(Q, Qaux)`` for the given
+        mesh and model.
 
-        This avoids re-evaluating static mesh geometry (e.g. CellDiameter).
-        The CFL condition accounts for the DG polynomial degree via the
-        standard scaling: dt = CFL * h_cell / ((2*degree + 1) * max_eigenvalue).
+        Uses the classical RKDG CFL condition
+
+        .. math::
+
+            \\Delta t \\le \\mathrm{CFL} \\;
+                \\frac{h_\\text{cell}}{d \\, (2k+1) \\, |\\lambda|_\\text{max}}
+
+        where ``h_cell`` is the cell diameter, ``d`` the spatial
+        dimension, ``k`` the DG polynomial degree, and ``|λ|_max`` the
+        cell-local maximum absolute eigenvalue of the normal-projected
+        quasilinear matrix.  The factor ``1/(2k+1)`` is the theoretical
+        SSP-RK(k+1, k+1) stability constant (Cockburn & Shu, 1991) —
+        equivalently ``1/(2p−1)`` in the "polynomial order ``p = k+1``"
+        convention.  ``CFL`` is therefore a *safety factor* on top of
+        the theoretical limit, ≤ 1; defaults to ``0.9`` (aggressive but
+        stable on well-shaped meshes).  Drop it to ~0.5 for skewed
+        meshes, strong shocks, or unlimited DG(p≥1).
+
+        ``CellDiameter`` is the cell's longest edge — for triangles
+        roughly ``2·inradius`` times a quality factor.  The combination
+        ``CFL · h / (d · (2k+1) · λ)`` is the common engineering
+        approximation; a fully tight bound would use the inradius.
         """
         degree = self.dg_degree
+        dim = mesh.geometric_dimension()
 
         V0 = fd.FunctionSpace(mesh, "DG", 0)
         h = fd.Function(V0).interpolate(fd.CellDiameter(mesh))
-        dim = mesh.geometric_dimension()
 
-        # For DG degree p the effective wave speed factor is (2p+1)
         degree_factor = float(2 * degree + 1)
+        dim_factor = float(dim)
 
         def compute_dt(Q, Qaux):
             """Compute global stable dt for the given fields Q and Qaux."""
 
-            # Compute eigenvalues in coordinate directions
-            lam_x_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
-            lam_y_expr = self.max_abs_eigenvalue(model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
+            # Cell-local maximum absolute eigenvalue in the coordinate
+            # directions — bounds the spectral radius over all face
+            # normals on Cartesian-aligned cells; conservative on
+            # rotated/triangular cells.
+            lam_x_expr = self.max_abs_eigenvalue(
+                model, Q, Qaux, fd.as_vector([1.0, 0.0]), mesh)
+            lam_y_expr = self.max_abs_eigenvalue(
+                model, Q, Qaux, fd.as_vector([0.0, 1.0]), mesh)
 
             lam_x = fd.project(lam_x_expr, V0)
             lam_y = fd.project(lam_y_expr, V0)
             lam_local = fd.Function(V0)
-            lam_local.dat.data[:] = np.maximum(lam_x.dat.data_ro, lam_y.dat.data_ro)
+            lam_local.dat.data[:] = np.maximum(
+                lam_x.dat.data_ro, lam_y.dat.data_ro)
 
-            # Local stable dt -- scaled by (2*degree + 1) for higher-order DG
             dt_local = fd.Function(V0).interpolate(
-                CFL * (h / 2) / (degree_factor * lam_local + 1e-8)
+                CFL * h / (dim_factor * degree_factor * lam_local + 1e-8)
             )
 
-            # Global min across cells and MPI ranks
             dt_min = float(np.min(dt_local.dat.data_ro))
             dt_min = mesh.comm.allreduce(dt_min, op=MPI.MIN)
             return dt_min
@@ -419,6 +535,11 @@ class FiredrakeHyperbolicSolver:
         ) * fd.dS
 
         for tag, idx in map_boundary_tag_to_function_index.items():
+            # ``__all__`` is the sentinel emitted by
+            # ``get_map_boundary_tag_to_boundary_function_index`` when
+            # the mesh has no named physical groups — apply the BC
+            # over every exterior facet via ``fd.ds`` (no subdomain).
+            ds_measure = fd.ds if tag == "__all__" else fd.ds(tag)
 
             # Position and "distance" placeholders
             dX = x[0]
@@ -438,7 +559,7 @@ class FiredrakeHyperbolicSolver:
                 test_q,
                 self.numerical_flux(runtime_model, Q, Q_bnd, Qaux_n, Qaux_n,
                                     runtime_model.parameters, n, mesh)
-            ) * fd.ds(tag)
+            ) * ds_measure
 
             Dp, Dm = nc_flux(Q, Q_bnd, Qaux_n, Qaux_n, n)
             weak_form += (
@@ -446,14 +567,27 @@ class FiredrakeHyperbolicSolver:
                     test_q,
                     Dm
                 )
-            ) * fd.ds(tag)
+            ) * ds_measure
 
-        # --- Diffusive flux contribution (IP-DG) for DG1+ ---
-        if self.dg_degree >= 1 and self._model_has_diffusive_flux(runtime_model):
+        # --- Explicit IMEX slot: ``diffusion_matrix_explicit`` →
+        # evaluated at Qn here.  The implicit ``diffusion_matrix`` slot
+        # is added inside the source step at Qnp1 (see
+        # _get_weak_form_source).
+        sm = self._state.system_model
+        if self._slot_is_nonzero(sm, "diffusion_matrix_explicit"):
             weak_form += self._get_weak_form_diffusion(
                 runtime_model, Q, Qaux_n, test_q, mesh, n,
                 map_boundary_tag_to_function_index, sim_time, x, x_3d,
+                slot="diffusion_matrix_explicit",
             )
+
+        # --- Explicit IMEX slot: ``source_explicit`` → evaluated at Qn
+        # here (Forward-Euler).  The implicit ``source`` slot is added
+        # inside the source step at Qnp1.
+        if self._slot_is_nonzero(sm, "source_explicit"):
+            S_expl = runtime_model.source_explicit(
+                Q, Qaux_n, runtime_model.parameters)
+            weak_form -= fd.dot(test_q, S_expl) * fd.dx
 
         return weak_form
 
@@ -494,17 +628,17 @@ class FiredrakeHyperbolicSolver:
 
         zero = fd.Constant(0.0)
 
-        # Build vectors that are nonzero only for source-active components
+        # Always include the (Qnp1[i] − Q_star[i]) identity row for
+        # every component — otherwise the Jacobian rows for components
+        # without a source term are identically zero and the Newton/KSP
+        # solve diverges (DIVERGED_LINEAR_SOLVE).  Only the source RHS
+        # is restricted to ``source_indices``; non-source components
+        # propagate the convective step's value unchanged.
         diff_restricted = []
         source_restricted = []
-
         for i in range(ncomp):
-            if i in source_indices:
-                diff_restricted.append(Qnp1[i] - Q_star[i])
-                source_restricted.append(source_full[i])
-            else:
-                diff_restricted.append(zero)
-                source_restricted.append(zero)
+            diff_restricted.append(Qnp1[i] - Q_star[i])
+            source_restricted.append(source_full[i] if i in source_indices else zero)
 
         diff_restricted = fd.as_vector(diff_restricted)
         source_restricted = fd.as_vector(source_restricted)
@@ -513,88 +647,239 @@ class FiredrakeHyperbolicSolver:
         weak_form = fd.dot(test_q, diff_restricted / dt) * fd.dx
         weak_form -= fd.dot(test_q, source_restricted) * fd.dx
 
+        # Implicit IMEX slot: ``diffusion_matrix`` evaluated at Qnp1.
+        # Newton drives both friction and diffusion to their implicit
+        # fixed-point — no parabolic CFL.
+        sm = self._state.system_model
+        if self._slot_is_nonzero(sm, "diffusion_matrix"):
+            weak_form += self._get_weak_form_diffusion(
+                runtime_model, Qnp1, Qaux_np1, test_q, mesh, n,
+                map_boundary_tag_to_function_index, sim_time, x, x_3d,
+                slot="diffusion_matrix",
+            )
+
         return weak_form
 
     # ------------------------------------------------------------------
-    # IP-DG diffusive flux
+    # Diffusive flux — TPFA (DG0) / IP-DG (DG1+)
     # ------------------------------------------------------------------
 
     def _get_weak_form_diffusion(self, runtime_model, Q, Qaux, test_q, mesh, n,
                                  map_boundary_tag_to_function_index,
-                                 sim_time, x, x_3d):
-        """Interior Penalty DG (IP-DG) discretisation of the diffusive flux.
+                                 sim_time, x, x_3d,
+                                 slot="diffusion_matrix"):
+        """Discretise ``-∇·(A:∇Q)`` — TPFA for DG(0), IP-DG for DG(1+).
 
-        For DG0 this returns zero (grad(Q) = 0 inside each cell, and face-based
-        diffusion is already captured by the Rusanov dissipation in the numerical
-        flux).  For DG1+ the standard symmetric IP-DG form is used:
+        ``A = sm.<slot>`` (default ``diffusion_matrix``, i.e. the
+        implicit slot) is a rank-4 UFL tensor of shape
+        ``(n_eq, n_state, n_dim, n_dim)``.  Pass ``slot=
+        "diffusion_matrix_explicit"`` to build the explicit form.
 
-        - Volume:  integral nu * grad(Q) : grad(v) dx
-        - Interior faces:  -avg(nu * grad(Q)) . jump(v) dS
-                           -avg(nu * grad(v)) . jump(Q) dS
-                           + (sigma / h_F) jump(Q) . jump(v) dS
-        - Exterior faces:  analogous Dirichlet penalty terms
+        The two DG cases use different formulations because the cell-
+        interior gradient is ``≡ 0`` for DG(0):
+
+        - **DG(0) — TPFA** (two-point flux approximation).  Face-normal
+          directional derivative approximated by the centroid-to-
+          centroid finite difference; bilinear contribution
+          ``+∫ [v] · M_avg · [Q] / d_face dS`` over interior facets,
+          with ``M[i,j] = Σ_{d,e} A[i,j,d,e]·n[d]·n[e]``.
+        - **DG(1+) — symmetric IP-DG**: volume + consistency +
+          symmetry + penalty.
+
+        Boundary diffusive contributions are zero (homogeneous Neumann)
+        — adequate for wall/outflow patterns.  Extend when a Dirichlet
+        diffusive boundary is needed.
         """
-        degree = self.dg_degree
-
-        if degree < 1:
-            # DG0: no within-cell gradient, diffusion handled by numerical flux
+        sm = self._state.system_model
+        if not self._slot_is_nonzero(sm, slot):
             return fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
 
-        if not self._model_has_diffusive_flux(runtime_model):
-            return fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
-
-        ncomp = Q.function_space().value_size
-
-        # Penalty parameter: scale with degree^2 / h_F (standard IP-DG)
-        sigma = fd.Constant(float(10.0 * degree ** 2))
-        h_F = fd.CellDiameter(mesh)  # local cell diameter
-
-        # The model's diffusive_flux is symbolically F_diff(Q, Qaux, gradQ, p).
-        # In the UFL context we can compute gradQ = grad(Q) directly.
-        grad_Q = fd.grad(Q)  # shape (ncomp, gdim)
-
-        # Construct the diffusive flux tensor from the model.
+        n_eq = sm.n_equations
+        n_st = sm.n_state
         gdim = mesh.geometric_dimension()
+        assert n_st == Q.function_space().value_size, (
+            f"{slot} expects n_state == ncomp(Q) for the contraction "
+            "with grad(Q)."
+        )
 
-        # Build a flat gradient vector matching the model's gradient_variables
-        # ordering: [dQ0_d0, dQ0_d1, dQ1_d0, dQ1_d1, ...]
-        grad_flat_components = []
-        for i in range(ncomp):
-            for d in range(gdim):
-                grad_flat_components.append(grad_Q[i, d])
-        grad_flat = fd.as_vector(grad_flat_components)
+        if self.dg_degree == 0:
+            return self._diffusion_form_tpfa(
+                sm, Q, Qaux, test_q, mesh, n, runtime_model, gdim, slot,
+            )
 
-        # Evaluate the model's diffusive flux: shape (ncomp, gdim) as a UFL expr
-        D_flux = runtime_model.diffusive_flux(Q, Qaux, grad_flat, runtime_model.parameters)
+        # Lambdify A slab-by-slab through the UFL module so that
+        # ``A_slabs[d][e]`` is an (n_eq, n_state) UFL tensor.
+        A_slabs = self._build_diffusion_slabs(sm, Q, Qaux, runtime_model, slot)
 
-        # --- Volume integral: - integral D_flux : grad(v) dx
-        # D_flux[i,d] * grad(test_q)[i,d]
-        grad_v = fd.grad(test_q)
+        # Volume tensor contraction.
+        grad_Q = fd.grad(Q)            # (n_state, gdim)
+        grad_v = fd.grad(test_q)       # (n_eq,    gdim)
+
+        # F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]
+        def F_diff(d):
+            terms = [A_slabs[d][e] * grad_Q[:, e] for e in range(gdim)]
+            # each term is (n_eq,) UFL vector; sum element-wise
+            return sum(terms[1:], terms[0])
+
+        # Penalty parameter (standard IP-DG): σ = c · p² scaled by h_F.
+        sigma = fd.Constant(float(10.0 * self.dg_degree ** 2))
+        h_F = fd.CellDiameter(mesh)
+
+        # +∫ F_diff : ∇v dx
         vol_form = fd.Constant(0.0) * fd.dot(test_q, Q) * fd.dx
-        for i in range(ncomp):
-            for d in range(gdim):
-                vol_form += D_flux[i * gdim + d] * grad_v[i, d] * fd.dx
+        for d in range(gdim):
+            vol_form += fd.inner(F_diff(d), grad_v[:, d]) * fd.dx
 
-        # --- Interior face terms (symmetric IP-DG)
-        avg_h = (h_F("+") + h_F("-")) / 2.0
+        # Interior face terms.  Build per-side F_diff and A·∇v from the
+        # ``+`` / ``-`` traces; jump and average are the standard DG ops.
+        A_plus = self._build_diffusion_slabs(sm, Q("+"), Qaux("+"), runtime_model, slot)
+        A_minus = self._build_diffusion_slabs(sm, Q("-"), Qaux("-"), runtime_model, slot)
+
+        def F_diff_side(A_side, Q_side, d):
+            gQ = fd.grad(Q_side)
+            terms = [A_side[d][e] * gQ[:, e] for e in range(gdim)]
+            return sum(terms[1:], terms[0])
+
+        n_plus = n("+")
+        jump_v = test_q("+") - test_q("-")
+        jump_Q = Q("+") - Q("-")
 
         face_form = fd.Constant(0.0) * fd.dot(test_q("+"), Q("+")) * fd.dS
-        for i in range(ncomp):
-            jump_Q_i = Q("+").sub(i) - Q("-").sub(i)
-            jump_v_i = test_q("+").sub(i) - test_q("-").sub(i)
 
-            for d in range(gdim):
-                avg_gradQ_id = 0.5 * (grad_Q("+")[i, d] + grad_Q("-")[i, d])
-                avg_gradv_id = 0.5 * (grad_v("+")[i, d] + grad_v("-")[i, d])
+        # Consistency: -∫ avg(F_diff·n) · [v] dS
+        avg_Fn = sum(
+            0.5 * (F_diff_side(A_plus,  Q("+"), d)
+                   + F_diff_side(A_minus, Q("-"), d)) * n_plus[d]
+            for d in range(gdim)
+        )
+        face_form -= fd.dot(avg_Fn, jump_v) * fd.dS
 
-                # Consistency and symmetry terms
-                face_form -= avg_gradQ_id * n("+")[d] * jump_v_i * fd.dS
-                face_form -= avg_gradv_id * n("+")[d] * jump_Q_i * fd.dS
+        # Symmetry: -∫ avg(A·∇v·n) · [Q] dS
+        gv_plus = fd.grad(test_q("+"))
+        gv_minus = fd.grad(test_q("-"))
+        Av_plus = sum(
+            sum(A_plus[d][e] * gv_plus[:, e] for e in range(gdim)) * n_plus[d]
+            for d in range(gdim)
+        )
+        Av_minus = sum(
+            sum(A_minus[d][e] * gv_minus[:, e] for e in range(gdim)) * n_plus[d]
+            for d in range(gdim)
+        )
+        face_form -= 0.5 * fd.dot(Av_plus + Av_minus, jump_Q) * fd.dS
 
-            # Penalty
-            face_form += (sigma / avg_h) * jump_Q_i * jump_v_i * fd.dS
+        # Penalty: +∫ (σ / avg_h) · [Q] · [v] dS
+        avg_h = (h_F("+") + h_F("-")) / 2.0
+        face_form += (sigma / avg_h) * fd.dot(jump_Q, jump_v) * fd.dS
 
         return vol_form + face_form
+
+    def _diffusion_form_tpfa(self, sm, Q, Qaux, test_q, mesh, n,
+                             runtime_model, gdim, slot="diffusion_matrix"):
+        """Two-point flux approximation diffusion form for DG(0).
+
+        On a piecewise-constant DG(0) space ``∇Q = 0`` inside each cell,
+        so a volume integral of ``F_diff : ∇v`` vanishes and the
+        diffusion has to enter *through* the faces.  TPFA approximates
+        the face-normal directional derivative by the centroid-to-
+        centroid finite difference
+
+        .. math::
+
+            (A : \\nabla Q \\cdot n)[i] \\approx
+              M_{ij} \\, \\frac{Q[j]_+ - Q[j]_-}{d_\\text{face}},
+              \\quad M_{ij} = \\sum_{d,e} A_{i,j,d,e}\\, n_d\\, n_e.
+
+        The cell-centroid distance ``d_face`` is approximated by the
+        average of the per-side ``CellDiameter`` — exact on regular
+        orthogonal quad meshes and a reasonable approximation on
+        triangular ones.  The arithmetic mean of the ``+`` / ``-``
+        contracted matrices is used for ``M_avg``; harmonic averaging
+        could be substituted if needed for strongly heterogeneous A.
+
+        Residual contribution per interior facet:
+
+        .. math::
+
+            +\\int_S [v] \\cdot \\frac{M_\\text{avg} \\, [Q]}{d_\\text{face}}\\, dS.
+
+        Boundary diffusive contributions are zero (homogeneous Neumann).
+        """
+        A_plus = self._build_diffusion_slabs(
+            sm, Q("+"), Qaux("+"), runtime_model, slot,
+        )
+        A_minus = self._build_diffusion_slabs(
+            sm, Q("-"), Qaux("-"), runtime_model, slot,
+        )
+        n_plus = n("+")
+
+        def _normal_contract(A_slabs):
+            """``M[i, j] = Σ_{d, e} A[d][e][i, j] · n[d] · n[e]``."""
+            return sum(
+                A_slabs[d][e] * n_plus[d] * n_plus[e]
+                for d in range(gdim) for e in range(gdim)
+            )
+
+        M_avg = 0.5 * (_normal_contract(A_plus) + _normal_contract(A_minus))
+
+        h_F = fd.CellDiameter(mesh)
+        d_face = (h_F("+") + h_F("-")) / 2.0
+
+        jump_Q = Q("+") - Q("-")
+        jump_v = test_q("+") - test_q("-")
+        flux_face = fd.dot(M_avg, jump_Q) / d_face  # (n_eq,) UFL vector
+
+        # Residual ∫_K (-∇·F_diff) v dx integrates to
+        # ``-∮_∂K F·n_∂K · v ds`` (no volume part on DG0).  Summing the
+        # two cell traces on an interior face f with ``n("+")`` outward
+        # of the "+" cell gives ``-∫_f F̂·n("+") · [v] dS``.  In the
+        # TPFA approximation F̂·n("+") ≈ M_avg · [Q] / d_face.
+        return -fd.dot(jump_v, flux_face) * fd.dS
+
+    @staticmethod
+    def _build_diffusion_slabs(sm, Q_side, Qaux_side, runtime_model,
+                               slot="diffusion_matrix"):
+        """Lambdify ``sm.<slot>`` per ``(d, e)`` slab through the UFL
+        module and substitute the UFL traces ``Q_side`` / ``Qaux_side``
+        for the state symbols.
+
+        ``slot`` selects which SystemModel slot to lower:
+        ``"diffusion_matrix"`` (implicit) or
+        ``"diffusion_matrix_explicit"`` (explicit IMEX companion).
+
+        Returns ``A_slabs[d][e]`` — each an ``(n_eq, n_state)`` UFL
+        tensor.  Outer index is the flux direction ``d``; inner is the
+        gradient direction ``e``.
+        """
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.basefunction import Function
+
+        A_tensor = getattr(sm, slot)
+        std_sig = Zstruct(variables=sm.variables,
+                          aux_variables=sm.aux_variables,
+                          parameters=sm.parameters)
+
+        n_eq = sm.n_equations
+        n_st = sm.n_state
+        gdim = sm.n_dim
+
+        slabs = []
+        for d in range(gdim):
+            row = []
+            for e in range(gdim):
+                slab_expr = sp.Matrix(
+                    n_eq, n_st,
+                    lambda i, j, _d=d, _e=e: A_tensor[i, j, _d, _e],
+                )
+                fn = Function(
+                    name=f"{slot}__d{d}_e{e}",
+                    args=std_sig,
+                    definition=slab_expr,
+                )
+                callable_fn = runtime_model._lambdify_function(
+                    fn, [runtime_model.module])
+                row.append(callable_fn(Q_side, Qaux_side, runtime_model.parameters))
+            slabs.append(row)
+        return slabs
 
     # ------------------------------------------------------------------
     # Slope limiter for DG1+
@@ -640,11 +925,20 @@ class FiredrakeHyperbolicSolver:
         else:
             limiter = fd.VertexBasedLimiter(V_scalar)
 
+        # Apply the limiter component-by-component on a scalar staging
+        # space, then re-assemble the limited vector and assign back to
+        # Q in one go.  Newer Firedrake rejects ``Q.sub(i).interpolate(
+        # scalar)`` (treated as a Matrix interpolation with a single
+        # argument → ``IndexError``); going through ``fd.as_vector`` +
+        # ``Q.interpolate`` keeps the operation in the supported
+        # rank-1 interpolation path.
+        limited = []
         for i in range(ncomp):
             qi = fd.Function(V_scalar)
             qi.interpolate(Q.sub(i))
             limiter.apply(qi)
-            Q.sub(i).interpolate(qi)
+            limited.append(qi)
+        Q.interpolate(fd.as_vector(limited))
 
     # ==================================================================
     # Solver construction
@@ -663,6 +957,11 @@ class FiredrakeHyperbolicSolver:
         J = fd.derivative(weak_form, Qnp1)
         problem = fd.NonlinearVariationalProblem(weak_form, Qnp1, J=J)
 
+        # ``pc_type=lu`` for the linear inner solve — when the source
+        # step also carries implicit diffusion the Jacobian is no
+        # longer diagonal (diffusion couples neighbouring cells), and
+        # block-Jacobi PC silently underperforms.  LU is direct and
+        # cheap on the DG mass+diffusion block.
         solver_parameters = {
             "snes_type": "newtonls",
             "snes_linesearch_type": "bt",
@@ -671,8 +970,8 @@ class FiredrakeHyperbolicSolver:
             "snes_rtol": 1e-8,
             "snes_atol": 1e-10,
             "snes_stol": 1e-12,
-            "ksp_type": "bcgs",
-            "pc_type": "jacobi",
+            "ksp_type": "gmres",
+            "pc_type": "lu",
         }
         solver = fd.NonlinearVariationalSolver(
             problem, solver_parameters=solver_parameters
@@ -803,9 +1102,56 @@ class FiredrakeHyperbolicSolver:
         model : zoomy_core Model
             Symbolic model with flux, source, boundary_conditions, etc.
         """
-        # -- Phase 1: Load mesh and create runtime model --
+        # -- Phase 1: Load mesh, freeze SystemModel, build runtimes --
         mesh = fd.Mesh(mesh_file)
+        if isinstance(model, SystemModel):
+            raise NotImplementedError(
+                "FiredrakeHyperbolicSolver currently requires a Model "
+                "instance.  SystemModel-only ingestion would need a "
+                "SystemModel-driven UFL runtime that handles every "
+                "operator (boundary kernels included); the Model-based "
+                "path is the only one that does so today.  Pass the "
+                "Model — SystemModel.from_model is run internally."
+            )
+        system_model = SystemModel.from_model(model)
+        # The Model-based UFL runtime stays the source of truth for the
+        # per-operator UFL emissions (flux, source,
+        # nonconservative_matrix, boundary kernels) — its lambdify path
+        # already handles the Model.functions registry end-to-end.
         runtime_model = UFLRuntimeModel(model)
+
+        # Symbolic Riemann solver → UFL runtime.  Wire ``max_wavespeed``
+        # to a UFL builder that pulls the eigenvalues from the
+        # Model-based runtime and takes the max of their absolute
+        # values; this is the same handshake the numpy backend uses
+        # (``solver_numpy.py`` line ~401).
+        def _max_wavespeed_ufl(*args, _rt=runtime_model, _sm=system_model):
+            n_eq = _sm.n_equations
+            n_aux = len(_sm.aux_state)
+            n_par = _sm.parameters.length()
+            Q = ufl.as_vector(list(args[:n_eq]))
+            Qaux = ufl.as_vector(list(args[n_eq:n_eq + n_aux])) \
+                if n_aux > 0 else ufl.as_vector([fd.Constant(0.0)])
+            p = ufl.as_vector(list(args[n_eq + n_aux:n_eq + n_aux + n_par]))
+            n_vec = ufl.as_vector(list(args[n_eq + n_aux + n_par:]))
+            ev = _rt.eigenvalues(Q, Qaux, p, n_vec)
+            out = abs(ev[0])
+            for i in range(1, n_eq):
+                out = ufl.max_value(abs(ev[i]), out)
+            return out
+
+        from zoomy_core.transformation.to_ufl import UFLRuntimeSymbolic
+        UFLRuntimeSymbolic.module["max_wavespeed"] = _max_wavespeed_ufl
+        numerics = self.riemann_solver_cls(system_model)
+        runtime_numerics = numerics.to_runtime_ufl()
+
+        # Stub state — populated incrementally below so that
+        # weak-form helpers reached during Phase 5 can already see
+        # ``self._state.system_model`` / ``self._state.runtime_numerics``.
+        object.__setattr__(self, "_state",
+                           Zstruct(system_model=system_model,
+                                   runtime_numerics=runtime_numerics,
+                                   runtime_model=runtime_model))
 
         # Rebuild IdentityMatrix to match the actual number of variables
         nvar = runtime_model.n_variables
@@ -859,6 +1205,8 @@ class FiredrakeHyperbolicSolver:
         state = Zstruct(
             mesh=mesh,
             runtime_model=runtime_model,
+            system_model=system_model,
+            runtime_numerics=runtime_numerics,
             model=model,
             V=V,
             Vaux=Vaux,
@@ -975,7 +1323,38 @@ class FiredrakeHyperbolicSolver:
         so that ``FiredrakeHyperbolicSolverAMR`` continues to work.
         """
         mesh = fd.Mesh(mshfile)
+        if isinstance(model, SystemModel):
+            raise NotImplementedError(
+                "FiredrakeHyperbolicSolver requires a Model instance; "
+                "SystemModel.from_model is called internally."
+            )
+        system_model = SystemModel.from_model(model)
         runtime_model = UFLRuntimeModel(model)
+
+        # Symbolic Riemann solver → UFL runtime (mirrors setup_simulation).
+        def _max_wavespeed_ufl(*args, _rt=runtime_model, _sm=system_model):
+            n_eq = _sm.n_equations
+            n_aux = len(_sm.aux_state)
+            n_par = _sm.parameters.length()
+            Q = ufl.as_vector(list(args[:n_eq]))
+            Qaux = ufl.as_vector(list(args[n_eq:n_eq + n_aux])) \
+                if n_aux > 0 else ufl.as_vector([fd.Constant(0.0)])
+            p = ufl.as_vector(list(args[n_eq + n_aux:n_eq + n_aux + n_par]))
+            n_vec = ufl.as_vector(list(args[n_eq + n_aux + n_par:]))
+            ev = _rt.eigenvalues(Q, Qaux, p, n_vec)
+            out = abs(ev[0])
+            for i in range(1, n_eq):
+                out = ufl.max_value(abs(ev[i]), out)
+            return out
+
+        from zoomy_core.transformation.to_ufl import UFLRuntimeSymbolic
+        UFLRuntimeSymbolic.module["max_wavespeed"] = _max_wavespeed_ufl
+        numerics = self.riemann_solver_cls(system_model)
+        runtime_numerics = numerics.to_runtime_ufl()
+        object.__setattr__(self, "_state",
+                           Zstruct(system_model=system_model,
+                                   runtime_numerics=runtime_numerics,
+                                   runtime_model=runtime_model))
 
         # Rebuild IdentityMatrix to match the actual number of variables
         nvar = runtime_model.n_variables
@@ -1005,177 +1384,3 @@ class FiredrakeHyperbolicSolver:
                 Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index)
 
 
-# ======================================================================
-# Free-surface solver (SWE, SME, VAM)
-# ======================================================================
-
-@define(frozen=True, slots=True, kw_only=True)
-class FiredrakeFreeSurfaceSolver(FiredrakeHyperbolicSolver):
-    """DG solver for free-surface flows (SWE, SME, VAM).
-
-    Extends the generic :class:`FiredrakeHyperbolicSolver` with:
-
-    - **Hydrostatic reconstruction** at cell interfaces to ensure
-      well-balanced treatment of the lake-at-rest steady state.
-    - **Wet/dry handling**: velocity capping and positivity enforcement
-      on the water depth *h*.
-    - **Source index filtering**: source terms act on all variables
-      except bathymetry (index 0).
-
-    State layout assumption: ``Q[0] = b``, ``Q[1] = h``, ``Q[2:] = momenta``.
-    """
-
-    # ==================================================================
-    # Overridden introspection: exclude bathymetry from source
-    # ==================================================================
-
-    @staticmethod
-    def _model_source_indices(model):
-        """Return indices of variables that receive source terms.
-
-        For free-surface models this is all indices except b (index 0).
-        """
-        sym = model.model if hasattr(model, "model") else model
-        keys = list(sym.variables.keys()) if hasattr(sym.variables, "keys") else []
-        if "h" in keys and "b" in keys:
-            # SWE-family: source acts on everything except bathymetry (idx 0)
-            return list(range(1, len(keys)))
-        # Fallback to generic behaviour if introspection fails
-        return list(range(len(keys)))
-
-    # ==================================================================
-    # Hydrostatic reconstruction
-    # ==================================================================
-
-    def hydrostatic_reconstruction(self, Ql, Qr):
-        """Hydrostatic reconstruction for shallow water in Firedrake/UFL.
-
-        State layout: Q[0] = b, Q[1] = h, Q[2] = hu (if present), others untouched.
-        """
-        bL, hL = Ql[0], Ql[1]
-        bR, hR = Qr[0], Qr[1]
-
-        # Free surface
-        etaL = hL + bL
-        etaR = hR + bR
-
-        # max(b_L, b_R) in UFL
-        b_star = ufl.max_value(bL, bR)
-
-        eps = fd.Constant(1e-4)
-
-        # Reconstructed depths (>= 0)
-        hL_star = ufl.max_value(0.0, etaL - b_star)
-        hR_star = ufl.max_value(0.0, etaR - b_star)
-
-        # Number of components in Q
-        ncomp = Ql.ufl_shape[0]
-
-        # Build component lists manually (no slicing)
-        compsL = [None] * ncomp
-        compsR = [None] * ncomp
-
-        # b stays the same
-        compsL[0] = bL
-        compsR[0] = bR
-
-        # h replaced by reconstructed depths
-        compsL[1] = hL_star
-        compsR[1] = hR_star
-
-        if ncomp > 2:
-            # Assume Q[2] is hu; we want hu* = h* u
-            hL_eff = ufl.max_value(hL, eps)  # regularized division
-            hR_eff = ufl.max_value(hR, eps)
-
-            uL = Ql[2] / hL_eff
-            uR = Qr[2] / hR_eff
-
-            compsL[2] = hL_star * uL
-            compsR[2] = hR_star * uR
-
-            # Any extra components: just copy over unchanged
-            for i in range(3, ncomp):
-                compsL[i] = Ql[i]
-                compsR[i] = Qr[i]
-
-        # If ncomp == 2, we're done; the remaining entries are already None but unused.
-
-        Ql_star = ufl.as_vector(compsL)
-        Qr_star = ufl.as_vector(compsR)
-
-        return Ql_star, Qr_star
-
-    def _reconstruct_states(self, Ql, Qr):
-        """Apply hydrostatic reconstruction for free-surface models."""
-        return self.hydrostatic_reconstruction(Ql, Qr)
-
-    # ==================================================================
-    # Overridden state updates: wet/dry handling
-    # ==================================================================
-
-    def update_Qaux(self, Q, Qaux, runtime_model=None, eps=1e-8):
-        """Update auxiliary variables.
-
-        If *runtime_model* is provided and exposes an ``update_aux_variables``
-        callback, that model-driven update is used.  Otherwise the legacy
-        SWE-specific path (h_inv from Q[1]) is used for backward compatibility.
-        """
-        if runtime_model is not None and hasattr(runtime_model, "update_aux_variables"):
-            Qaux_new = runtime_model.update_aux_variables(Q, Qaux, runtime_model.parameters)
-            Qaux.interpolate(Qaux_new)
-            return
-
-        # Legacy SWE fallback: assumes Q[1] = h, Qaux[0] = h_inv
-        h = Q.sub(1)
-        eps = fd.Constant(1e-4)
-
-        h_new = fd.max_value(h, eps)
-        h_inv = 1 / (h_new)
-
-        Qaux_new = fd.as_vector([
-            h_inv,
-        ])
-        Qaux.interpolate(Qaux_new)
-
-    def update_Q(self, Q, Qaux, runtime_model=None):
-        """Update conserved variables (positivity, velocity capping, etc.).
-
-        If *runtime_model* is provided and exposes an ``update_variables``
-        callback, that model-driven update is used.  Otherwise the legacy
-        SWE-specific path (velocity capping on 4-component [b,h,hu,hv]) is
-        used for backward compatibility.
-        """
-        if runtime_model is not None and hasattr(runtime_model, "update_variables"):
-            Q_new = runtime_model.update_variables(Q, Qaux, runtime_model.parameters)
-            Q.interpolate(Q_new)
-            return
-
-        # Legacy SWE fallback: assumes Q = [b, h, hu, hv]
-        ncomp = Q.function_space().value_size
-        if ncomp < 4:
-            # Not the 4-component SWE layout -- skip legacy capping
-            return
-
-        h = Q.sub(1)
-        eps = fd.Constant(1e-4)
-
-        h_new = fd.max_value(h, eps)
-        wet = fd.conditional(h > eps, 1.0, 0.0)
-
-        max_vel_cap = fd.Constant(100)
-
-        u = Q.sub(2) / (h_new)
-        u_new = wet * fd.sign(u) * fd.min_value(abs(u), max_vel_cap)
-
-        v = Q.sub(3) / (h_new)
-        v_new = wet * fd.sign(v) * fd.min_value(abs(v), max_vel_cap)
-
-        # Build the whole updated Q vector
-        Q_new = fd.as_vector([
-            Q.sub(0),               # b (bathymetry)
-            Q.sub(1),               # h (depth, kept as-is)
-            h_new * u_new,          # zero momentum if dry
-            h_new * v_new,          # zero momentum if dry
-        ])
-        Q.interpolate(Q_new)
