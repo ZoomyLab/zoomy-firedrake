@@ -78,11 +78,6 @@ class FiredrakeHyperbolicSolver:
     # Nested struct with factory
     settings: Zstruct = field(factory=lambda: Settings.default())
 
-    # Identity matrix -- dynamically rebuilt in setup_simulation() to match
-    # the model's number of variables.  The default is never used at runtime;
-    # it is kept only so the class can be instantiated without extra args.
-    IdentityMatrix = field(factory=lambda: ufl.as_tensor([[1, 0], [0, 1]]))
-
     # Internal simulation state, populated by setup_simulation().
     # Declared as an attrs field (init=False) so it has a slot on frozen classes.
     _state: object = field(init=False, default=None, repr=False, eq=False)
@@ -95,42 +90,6 @@ class FiredrakeHyperbolicSolver:
     # ==================================================================
     # Model introspection helpers
     # ==================================================================
-
-    @staticmethod
-    def _stationary_state_mask(system_model):
-        """Indices of state rows that should NOT receive LF-style
-        dissipation in the NCP fluctuation.  Currently just the
-        bathymetry ``b`` when it lives in the conservative state —
-        ``b`` is passive in the SWE family but discontinuous at DG(0),
-        so the dissipative ``lam · Id · (Qr − Ql)`` term would otherwise
-        propagate the discrete jump across faces and drift the bed.
-        """
-        mask = []
-        for i, sym in enumerate(system_model.state):
-            if str(sym) == "b":
-                mask.append(i)
-        return tuple(mask)
-
-    @staticmethod
-    def _get_identity_matrix(n, mask_indices=()):
-        """Build an n×n UFL identity tensor with selected diagonal
-        entries zeroed.
-
-        ``mask_indices`` lists state-row indices that should NOT
-        receive the LF/Rusanov-style dissipation term
-        ``lam · Id · (Qr − Ql)`` in the non-conservative-flux
-        fluctuation builder.  Mirroring
-        :meth:`Rusanov.get_viscosity_identity_flux`, the canonical
-        masked row is the bathymetry ``b`` when it lives in the
-        conservative state — its physical flux is zero everywhere
-        in a well-posed SWE, but the LF dissipation would still
-        propagate jumps in ``b`` (which is discontinuous at DG(0))
-        across faces and drift the bed.
-        """
-        rows = [[1 if i == j else 0 for j in range(n)] for i in range(n)]
-        for i in mask_indices:
-            rows[i][i] = 0
-        return ufl.as_tensor(rows)
 
     @staticmethod
     def _model_has_free_surface(model):
@@ -247,101 +206,59 @@ class FiredrakeHyperbolicSolver:
     # ==================================================================
 
     def get_nonconservative_flux(self, model, parameters, mesh):
-        # The NCP path-integral contributes ``½(A ± λI)·[Q]`` where
-        # ``A = Σ_d (∫₀¹ B_d(Q(τ)) dτ) · n_d`` and ``B`` is the rank-3
-        # ``nonconservative_matrix``.  The Model-based UFL emitter
-        # collapses rank-3 ``NDimArray`` to a ``(n_eq², n_dim)`` flat
-        # matrix on lambdify, so we cannot just call ``fd.dot`` and add
-        # an ``(n_eq, n_eq)`` identity.  Instead we lambdify ``B``
-        # slab-by-slab over the dim axis (each slab is a proper
-        # ``(n_eq, n_eq)`` Matrix) and contract with the normal in UFL.
+        """Closure returning ``(Dp, Dm)`` — the NCP path-integral
+        fluctuations split into outgoing / incoming contributions.
+
+        This is just a thin shim over
+        ``self._state.runtime_numerics.numerical_fluctuations`` from
+        the SystemModel-driven symbolic Riemann library.  The library
+        already does the Gauss-Legendre path integral, the LF
+        stabilisation, and the bed-row mask in
+        :meth:`NonconservativeRusanov.get_viscosity_identity_fluctuations`.
+        Earlier this method re-implemented the same algorithm in
+        Python + UFL — that bypassed the symbolic library's
+        well-balancing / bed-mask logic and let DG(0)-discontinuous
+        ``b`` drift through the LF stabilisation term.
+
+        For Riemann solvers that don't override
+        ``numerical_fluctuations`` (e.g. plain ``Rusanov``, ``HLL``)
+        the lambdified callable returns zero and the contribution is
+        silently dropped.
+        """
         sm = self._state.system_model
-        ncp_is_zero = all(sp.simplify(e) == 0
-                          for e in sp.flatten(sm.nonconservative_matrix))
+        n_var = sm.n_equations
+
+        # Short-circuit: when the model has no NCP at all, the
+        # symbolic ``numerical_fluctuations`` lambdifies to numerical
+        # zeros that lose their mesh reference; multiplying by
+        # ``fd.dS`` then trips "missing integration domain".  Returning
+        # a mesh-aware ``fd.Constant(0.0)`` vector directly avoids
+        # that and skips the lambdified-call cost.
+        ncp_is_zero = all(
+            sp.simplify(e) == 0
+            for e in sp.flatten(sm.nonconservative_matrix)
+        )
         if ncp_is_zero:
-            nvar = sm.n_equations
-            zero_vec = fd.as_vector([fd.Constant(0.0)] * nvar)
+            zero_vec = fd.as_vector([fd.Constant(0.0)] * n_var)
 
             def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
                 return zero_vec, zero_vec
             return nc_flux
 
-        n_eq = sm.n_equations
-        n_dim = sm.n_dim
-        ncp_slab_fns = self._build_ncp_slab_fns(sm)
-
-        samples, weights = np.polynomial.legendre.leggauss(3)
-        sample_pts = [(samples[k] + 1) / 2 for k in range(len(samples))]
-        sample_wts = [0.5 * weights[k] for k in range(len(weights))]
-
-        def _ncp_path_avg(Q_path, Qaux_path):
-            """``(n_eq, n_eq, n_dim)`` UFL tensor of the per-dim NCP
-            slabs, averaged over the path integration sample points."""
-            slabs = [
-                sum(w * fn(Q_path(xi), Qaux_path(xi), parameters)
-                    for xi, w in zip(sample_pts, sample_wts))
-                for fn in ncp_slab_fns
-            ]
-            return slabs  # list of n_dim (n_eq, n_eq) UFL tensors
+        rn = self._state.runtime_numerics
 
         def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
-            def Q_path(xi): return Ql + xi * (Qr - Ql)
-            def Qaux_path(xi): return Qauxl + xi * (Qauxr - Qauxl)
-            slabs = _ncp_path_avg(Q_path, Qaux_path)
-            # A = Σ_d slab_d · n_d  ->  (n_eq, n_eq) UFL tensor
-            A = sum(slabs[d] * n[d] for d in range(n_dim))
-            lam_l = self.max_abs_eigenvalue(model, Ql, Qauxl, n, mesh)
-            lam_r = self.max_abs_eigenvalue(model, Qr, Qauxr, n, mesh)
-            lam = ufl.max_value(lam_l, lam_r)
-            Id = self.IdentityMatrix
-
-            Dp = 0.5 * fd.dot(A + lam * Id, (Qr - Ql))
-            Dm = 0.5 * fd.dot(A - lam * Id, (Qr - Ql))
+            # ``numerical_fluctuations`` returns a ``(2, n_var)`` UFL
+            # tensor: row 0 = Dp (outgoing), row 1 = Dm (incoming).
+            # UFL rank-2-tensor[0] does NOT auto-collapse to a
+            # length-n_var vector — slice element-wise.
+            fl = rn.numerical_fluctuations(
+                Ql, Qr, Qauxl, Qauxr, parameters, n,
+            )
+            Dp = fd.as_vector([fl[0, i] for i in range(n_var)])
+            Dm = fd.as_vector([fl[1, i] for i in range(n_var)])
             return Dp, Dm
         return nc_flux
-
-    def _build_ncp_slab_fns(self, sm):
-        """Lambdify ``sm.nonconservative_matrix`` per dim slab as a
-        proper ``(n_eq, n_eq)`` Matrix-valued callable taking
-        ``(Q, Qaux, p)`` — UFL-emittable.  Used by the path-integral
-        NCP fluctuation builder so the rank-3 tensor never collapses
-        to a flat ``(n_eq², n_dim)`` matrix in lambdification.
-        """
-        from zoomy_core.misc.misc import Zstruct
-        from zoomy_core.model.basefunction import Function
-        runtime_model = self._state.runtime_model if hasattr(
-            self._state, "runtime_model") else None
-        if runtime_model is None:
-            # ``_state.runtime_model`` is set in setup_simulation
-            # before _get_weak_form_convective is called; in the legacy
-            # _setup path it is supplied via closure.  Falling back to
-            # the SystemModel-driven UFL runtime would also work but
-            # the Model-based one is the validated path.
-            raise RuntimeError(
-                "runtime_model not on _state yet — _build_ncp_slab_fns "
-                "must be called after setup_simulation has built the "
-                "UFL runtime."
-            )
-
-        std_sig = Zstruct(
-            variables=sm.variables,
-            aux_variables=sm.aux_variables,
-            parameters=sm.parameters,
-        )
-        n_eq = sm.n_equations
-        n_dim = sm.n_dim
-        slab_fns = []
-        for d in range(n_dim):
-            slab = sp.Matrix(
-                n_eq, n_eq,
-                lambda i, j, _d=d: sm.nonconservative_matrix[i, j, _d],
-            )
-            fn = Function(name=f"nonconservative_matrix__d{d}",
-                          args=std_sig, definition=slab)
-            slab_fns.append(
-                runtime_model._lambdify_function(fn, [runtime_model.module])
-            )
-        return slab_fns
 
     def numerical_flux(self, model, Ql, Qr, Qauxl, Qauxr, parameters, n, mesh):
         """Apply the symbolic Riemann solver lowered to UFL.
@@ -1223,18 +1140,6 @@ class FiredrakeHyperbolicSolver:
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model))
 
-        # Rebuild IdentityMatrix to match the actual number of variables.
-        # Mask the bathymetry row (when ``b`` is in the conservative
-        # state) so the NCP-fluctuation LF dissipation ``lam · Id ·
-        # (Qr − Ql)`` does not propagate jumps in ``b`` across faces;
-        # see ``_get_identity_matrix`` docstring.
-        nvar = runtime_model.n_variables
-        mask = self._stationary_state_mask(system_model)
-        object.__setattr__(
-            self, "IdentityMatrix",
-            self._get_identity_matrix(nvar, mask_indices=mask),
-        )
-
         # -- Phase 2: Build function spaces --
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
             self._get_functionspaces(mesh, runtime_model)
@@ -1433,14 +1338,6 @@ class FiredrakeHyperbolicSolver:
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model))
-
-        # Rebuild IdentityMatrix; mask the b row (see setup_simulation).
-        nvar = runtime_model.n_variables
-        mask = self._stationary_state_mask(system_model)
-        object.__setattr__(
-            self, "IdentityMatrix",
-            self._get_identity_matrix(nvar, mask_indices=mask),
-        )
 
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
             self._get_functionspaces(mesh, runtime_model)
