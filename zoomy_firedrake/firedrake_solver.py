@@ -97,9 +97,39 @@ class FiredrakeHyperbolicSolver:
     # ==================================================================
 
     @staticmethod
-    def _get_identity_matrix(n):
-        """Build an n x n UFL identity tensor."""
+    def _stationary_state_mask(system_model):
+        """Indices of state rows that should NOT receive LF-style
+        dissipation in the NCP fluctuation.  Currently just the
+        bathymetry ``b`` when it lives in the conservative state —
+        ``b`` is passive in the SWE family but discontinuous at DG(0),
+        so the dissipative ``lam · Id · (Qr − Ql)`` term would otherwise
+        propagate the discrete jump across faces and drift the bed.
+        """
+        mask = []
+        for i, sym in enumerate(system_model.state):
+            if str(sym) == "b":
+                mask.append(i)
+        return tuple(mask)
+
+    @staticmethod
+    def _get_identity_matrix(n, mask_indices=()):
+        """Build an n×n UFL identity tensor with selected diagonal
+        entries zeroed.
+
+        ``mask_indices`` lists state-row indices that should NOT
+        receive the LF/Rusanov-style dissipation term
+        ``lam · Id · (Qr − Ql)`` in the non-conservative-flux
+        fluctuation builder.  Mirroring
+        :meth:`Rusanov.get_viscosity_identity_flux`, the canonical
+        masked row is the bathymetry ``b`` when it lives in the
+        conservative state — its physical flux is zero everywhere
+        in a well-posed SWE, but the LF dissipation would still
+        propagate jumps in ``b`` (which is discontinuous at DG(0))
+        across faces and drift the bed.
+        """
         rows = [[1 if i == j else 0 for j in range(n)] for i in range(n)]
+        for i in mask_indices:
+            rows[i][i] = 0
         return ufl.as_tensor(rows)
 
     @staticmethod
@@ -1193,9 +1223,17 @@ class FiredrakeHyperbolicSolver:
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model))
 
-        # Rebuild IdentityMatrix to match the actual number of variables
+        # Rebuild IdentityMatrix to match the actual number of variables.
+        # Mask the bathymetry row (when ``b`` is in the conservative
+        # state) so the NCP-fluctuation LF dissipation ``lam · Id ·
+        # (Qr − Ql)`` does not propagate jumps in ``b`` across faces;
+        # see ``_get_identity_matrix`` docstring.
         nvar = runtime_model.n_variables
-        object.__setattr__(self, "IdentityMatrix", self._get_identity_matrix(nvar))
+        mask = self._stationary_state_mask(system_model)
+        object.__setattr__(
+            self, "IdentityMatrix",
+            self._get_identity_matrix(nvar, mask_indices=mask),
+        )
 
         # -- Phase 2: Build function spaces --
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
@@ -1396,9 +1434,13 @@ class FiredrakeHyperbolicSolver:
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model))
 
-        # Rebuild IdentityMatrix to match the actual number of variables
+        # Rebuild IdentityMatrix; mask the b row (see setup_simulation).
         nvar = runtime_model.n_variables
-        object.__setattr__(self, "IdentityMatrix", self._get_identity_matrix(nvar))
+        mask = self._stationary_state_mask(system_model)
+        object.__setattr__(
+            self, "IdentityMatrix",
+            self._get_identity_matrix(nvar, mask_indices=mask),
+        )
 
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
             self._get_functionspaces(mesh, runtime_model)
