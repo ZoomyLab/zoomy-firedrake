@@ -280,11 +280,21 @@ class FiredrakeHyperbolicSolver:
         # ``fd.dS`` then trips "missing integration domain".  Returning
         # a mesh-aware ``fd.Constant(0.0)`` vector directly avoids
         # that and skips the lambdified-call cost.
+        # Short-circuit when both NCP and hydrostatic_pressure are
+        # empty.  hydrostatic_pressure must also be checked because the
+        # Audusse 2004 well-balancing fluctuation S̃ (paper, eq. 2.18)
+        # lives in numerical_fluctuations and depends on
+        # ``hydrostatic_pressure``: skipping the call when NCP=0 but
+        # pressure≠0 silently drops S̃ and breaks lake-at-rest.
         ncp_is_zero = all(
             sp.simplify(e) == 0
             for e in sp.flatten(sm.nonconservative_matrix)
         )
-        if ncp_is_zero:
+        press_is_zero = all(
+            sp.simplify(e) == 0
+            for e in sp.flatten(sm.hydrostatic_pressure)
+        )
+        if ncp_is_zero and press_is_zero:
             zero_vec = fd.as_vector([fd.Constant(0.0)] * n_var)
 
             def nc_flux(Ql, Qr, Qauxl, Qauxr, n):
