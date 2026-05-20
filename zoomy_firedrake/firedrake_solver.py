@@ -538,18 +538,19 @@ class FiredrakeHyperbolicSolver:
 
         nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux_n("-"), Qaux_n("+"), n("-"))
-        weak_form += 0.5 * (
-            fd.dot(
-                test_q("+"),
-                Dp
-            )
-        ) * fd.dS
-        weak_form += 0.5 * (
-            fd.dot(
-                test_q("-"),
-                Dm
-            )
-        ) * fd.dS
+        # Dp / Dm come pre-split out of the DLM path-integral
+        # decomposition implemented in
+        # ``NonconservativeRusanov._compute_fluctuations`` —
+        # ``Dp = ½(advection + diss)``, ``Dm = ½(advection − diss)``
+        # with ``Dp + Dm = ∫₀¹ B(Ψ)·n dΨ`` (see Parés 2006, SIAM J.
+        # Numer. Anal. 44(1):300–321, eq. 3.8, and Castro et al. 2006,
+        # JCP 217, sec. 2).  Each cell receives its own half at unit
+        # weight — the ``solver_numpy`` backend assembles them this
+        # way too (``solver_numpy.py:526–527``).  Halving them a
+        # second time here would land NCP contributions at ¼ of the
+        # paper strength.
+        weak_form += fd.dot(test_q("+"), Dp) * fd.dS
+        weak_form += fd.dot(test_q("-"), Dm) * fd.dS
 
         for tag, idx in map_boundary_tag_to_function_index.items():
             # ``__all__`` is the sentinel emitted by
