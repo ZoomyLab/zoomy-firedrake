@@ -162,7 +162,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         grad_eps : float – floor for |∇h| when determining directions
         """
         mesh = Q.function_space().mesh()
-        dim  = mesh.geometric_dimension()     # expect 2
+        dim  = mesh.geometric_dimension     # expect 2
 
         # --- 1. Compute gradient of h on CG1 for smoothness -------------
         h_dg  = Q.sub(1)                      # DG0

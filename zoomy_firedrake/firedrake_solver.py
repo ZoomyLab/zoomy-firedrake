@@ -235,7 +235,7 @@ class FiredrakeHyperbolicSolver:
 
     def _get_x_and_n(self, mesh):
         x = fd.SpatialCoordinate(mesh)
-        dim = mesh.geometric_dimension()
+        dim = mesh.geometric_dimension
 
         # Always construct a 3D vector (fill missing components with 0)
         if dim == 1:
@@ -386,7 +386,7 @@ class FiredrakeHyperbolicSolver:
 
         family = element.family()
         degree = element.degree()
-        dim = mesh.geometric_dimension()
+        dim = mesh.geometric_dimension
 
         # Build coordinate field in the same FE family/degree
         V_coords = fd.VectorFunctionSpace(mesh, family, degree)
@@ -430,7 +430,7 @@ class FiredrakeHyperbolicSolver:
         approximation; a fully tight bound would use the inradius.
         """
         degree = self.dg_degree
-        dim = mesh.geometric_dimension()
+        dim = mesh.geometric_dimension
 
         degree_factor = float(2 * degree + 1)
         dim_factor = float(dim)
@@ -713,7 +713,7 @@ class FiredrakeHyperbolicSolver:
 
         n_eq = sm.n_equations
         n_st = sm.n_state
-        gdim = mesh.geometric_dimension()
+        gdim = mesh.geometric_dimension
         assert n_st == Q.function_space().value_size, (
             f"{slot} expects n_state == ncomp(Q) for the contraction "
             "with grad(Q)."
