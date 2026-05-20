@@ -1,3 +1,5 @@
+from typing import Optional
+
 import firedrake as fd
 from firedrake.functionspaceimpl import MixedFunctionSpace
 import ufl
@@ -8,6 +10,9 @@ from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.fvm.riemann_solvers import Rusanov
+from zoomy_firedrake.firedrake_compat import (
+    safe_extract_component, safe_assign_component,
+)
 import numpy as np
 from mpi4py import MPI
 
@@ -57,6 +62,22 @@ class FiredrakeHyperbolicSolver:
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
     limiter: str = field(default="vertex")  # "vertex", "p_weighted", or "none"
+    # Fields the slope limiter should **skip** (pass through
+    # unmodified).  A list of state-field handles — each accepted by
+    # :meth:`SystemModel.field_index`:
+    #
+    # - ``sp.Symbol``: ``model.variables.b``
+    # - ``str``:        ``"b"``
+    # - ``int``:        explicit index (discouraged — defeats the point)
+    #
+    # ``None`` (default) → auto-detect: use the SystemModel's
+    # :attr:`stationary_indices` set (fields whose evolution is
+    # identically zero by construction, e.g. bathymetry ``b`` in
+    # shallow-water).  Pass an empty list ``[]`` to force-limit
+    # everything despite auto-detection; pass an explicit list to
+    # add fields on top of the auto-detected set.  Resolved at
+    # :meth:`setup_simulation` time and cached on ``_state``.
+    limiter_exclude_fields: Optional[list] = field(default=None)
     # Symbolic Riemann solver class — must accept a SystemModel and
     # expose ``to_runtime_ufl()``.  Defaults to :class:`Rusanov`.
     # Swap to ``HLL`` / ``HLLC`` / ``PositiveRusanov`` for wet/dry.
@@ -382,29 +403,28 @@ class FiredrakeHyperbolicSolver:
         degree = self.dg_degree
         dim = mesh.geometric_dimension()
 
-        V0 = fd.FunctionSpace(mesh, "DG", 0)
-        h = fd.Function(V0).interpolate(fd.CellDiameter(mesh))
-
         degree_factor = float(2 * degree + 1)
         dim_factor = float(dim)
 
-        # Combine the per-direction wave-speed bound and the CFL
-        # formula into a single UFL expression, then interpolate it
-        # onto DG(0) (cell-local sample at the centroid).  Previously
-        # this stage did two ``fd.project(lam, V0)`` calls — each a
-        # global L2 solve against the DG(0) mass matrix — followed by
-        # an interpolate.  For a DG(0) Q the projection collapses to
-        # the cell-centroid sample, so we can skip the global solve
-        # entirely; for higher-order Q this is the standard
-        # engineering-CFL estimate (centroid sampling).  Bonus: a pure
-        # ``interpolate`` is purely local under MPI, while ``project``
-        # triggers a global KSP.
-        dt_local = fd.Function(V0)
+        # Sample the per-point CFL bound at every nodal DOF of a
+        # ``DG(degree)`` scalar space (i.e. one DOF per Q-DOF in each
+        # cell).  Taking ``np.min(dt_local.dat.data_ro)`` then picks
+        # the worst CFL constraint anywhere in the field — including
+        # sub-cell h-minima at DG(1+) vertices where a cell can have
+        # ``h_centroid > eps`` but ``h_vertex`` near zero (the
+        # dt-collapse failure mode observed on the DG(1) Malpasset
+        # run).  For DG(0) this collapses to the previous centroid
+        # sample (one DOF/cell).  ``fd.CellDiameter`` stays a pure UFL
+        # expression — the assembler broadcasts the per-cell value to
+        # each DOF inside that cell during ``interpolate``.
+        V_dt = fd.FunctionSpace(mesh, "DG", degree)
+        dt_local = fd.Function(V_dt)
+        h_cd = fd.CellDiameter(mesh)
 
         def compute_dt(Q, Qaux):
             """Compute global stable dt for the given fields Q and Qaux."""
             dt_expr = (
-                CFL * h
+                CFL * h_cd
                 / (
                     dim_factor * degree_factor
                     * ufl.max_value(
@@ -853,12 +873,43 @@ class FiredrakeHyperbolicSolver:
     # Slope limiter for DG1+
     # ------------------------------------------------------------------
 
+    def _resolve_limiter_exclude_indices(self, system_model) -> frozenset:
+        """Translate ``self.limiter_exclude_fields`` (a list of field
+        handles, or ``None``) into a frozenset of integer state indices.
+
+        Default behavior (``limiter_exclude_fields = None``) returns
+        :attr:`SystemModel.stationary_indices` — fields whose
+        evolution is identically zero by construction.  This is the
+        right thing for the canonical case (bathymetry ``b`` in
+        shallow-water): the limiter never touches ``b``, MPI rank
+        boundaries stay consistent, no spurious topography is created
+        or destroyed.
+
+        When the user passes an explicit list, each entry is resolved
+        via :meth:`SystemModel.field_index` (accepts symbol, name, or
+        int).  Passing an empty list disables the exclusion entirely
+        (forces the limiter onto every component).
+        """
+        if self.limiter_exclude_fields is None:
+            return system_model.stationary_indices
+        return frozenset(
+            system_model.field_index(f) for f in self.limiter_exclude_fields
+        )
+
     def _apply_slope_limiter(self, Q):
         """Apply slope limiter for DG degree >= 1.
 
         For vector function spaces the limiter is applied component-wise
         because both ``VertexBasedLimiter`` and ``PWeightedLimiter``
         operate on scalar spaces.
+
+        Components flagged in ``self._state.limiter_exclude_indices``
+        are **passed through unmodified** — limiting them would
+        spuriously perturb fields the model declares stationary
+        (e.g. bathymetry ``b`` in shallow-water), which under MPI
+        rank-splitting then differs across processes and silently
+        creates / destroys topography.  The exclude set is computed
+        at setup time via :meth:`_resolve_limiter_exclude_indices`.
 
         Supported modes (set via ``self.limiter``):
 
@@ -893,20 +944,60 @@ class FiredrakeHyperbolicSolver:
         else:
             limiter = fd.VertexBasedLimiter(V_scalar)
 
-        # Apply the limiter component-by-component on a scalar staging
-        # space, then re-assemble the limited vector and assign back to
-        # Q in one go.  Newer Firedrake rejects ``Q.sub(i).interpolate(
-        # scalar)`` (treated as a Matrix interpolation with a single
-        # argument → ``IndexError``); going through ``fd.as_vector`` +
-        # ``Q.interpolate`` keeps the operation in the supported
-        # rank-1 interpolation path.
-        limited = []
+        exclude = getattr(self._state, "limiter_exclude_indices",
+                          frozenset())
+
+        # Per-component limiting with **explicit dat.data slicing on
+        # both read and write**.  Excluded components (e.g. bathymetry
+        # ``b``) are never touched — bit-preserved.
+        #
+        # **Why direct dat slicing on the read side**: the obvious
+        # ``qi.interpolate(Q.sub(i))`` triggers a Firedrake stride bug
+        # in the interpolation kernel for ``VectorFunctionSpace.sub(i)``
+        # at ``i ≥ 2``: it silently zeroes scattered values in
+        # ``Q.sub(0)`` (b) on rank-boundary partitions.  Reproduced
+        # this session via the one-step diagnostic with a per-step
+        # b-probe inside the loop — b stayed clean through
+        # ``i = 0, 1``, then jumped to ~0 in select cells at the
+        # ``qi.interpolate(Q.sub(2))`` call.  Direct slicing avoids
+        # the kernel entirely.
+        #
+        # **Why direct dat slicing on the write side**: the old
+        # ``Q.interpolate(fd.as_vector(limited))`` re-vector path
+        # injected ~1% mass per step (the vector interpolation back
+        # into ``Q`` perturbs cell averages even though Kuzmin's
+        # kernel itself is cell-average-preserving — see the
+        # Firedrake VertexBasedLimiter source: ``q[ii] = qavg + alpha
+        # * (q[ii] - qavg)`` is conservative by construction).
+        #
+        # ``Q.dat.data[:, i] = qi.dat.data_ro[:]`` is an exact,
+        # bit-for-bit numpy slice copy mirroring how the IC writes
+        # ``Q`` (see ``MalpassetSolver.set_initial_condition``).  No
+        # projection, no interpolation, no layout ambiguity.
+        # Per-component limiting via the ``safe_*_component`` wrappers
+        # (see ``zoomy_firedrake.firedrake_compat`` for the bug
+        # documentation + the standalone reproducer).  When Firedrake
+        # fixes ``VectorFunctionSpace.sub(i).interpolate`` /
+        # ``.assign``, the wrappers collapse to plain
+        # ``.interpolate(Q.sub(i))`` and ``Q.sub(i).assign(qi)``.
+        #
+        # **Phase ordering matters**: all reads must complete before
+        # any writes.  Interleaving a write (direct ``dat.data``
+        # slice) and a subsequent read (``interpolate`` on a different
+        # subview) triggers a separate Firedrake bug where the read's
+        # halo handling fetches stale data and corrupts other
+        # columns.  Reproduced standalone — see the reproducer's
+        # final loop variant.
+        limited = {}
         for i in range(ncomp):
+            if i in exclude:
+                continue
             qi = fd.Function(V_scalar)
-            qi.interpolate(Q.sub(i))
+            safe_extract_component(qi, Q, i)
             limiter.apply(qi)
-            limited.append(qi)
-        Q.interpolate(fd.as_vector(limited))
+            limited[i] = qi
+        for i, qi in limited.items():
+            safe_assign_component(Q, qi, i)
 
     # ==================================================================
     # Solver construction
@@ -1135,10 +1226,13 @@ class FiredrakeHyperbolicSolver:
         # Stub state — populated incrementally below so that
         # weak-form helpers reached during Phase 5 can already see
         # ``self._state.system_model`` / ``self._state.runtime_numerics``.
+        limiter_exclude_indices = self._resolve_limiter_exclude_indices(
+            system_model)
         object.__setattr__(self, "_state",
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
-                                   runtime_model=runtime_model))
+                                   runtime_model=runtime_model,
+                                   limiter_exclude_indices=limiter_exclude_indices))
 
         # -- Phase 2: Build function spaces --
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
@@ -1185,11 +1279,16 @@ class FiredrakeHyperbolicSolver:
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
 
         # -- Store simulation state (frozen attrs -> object.__setattr__) --
+        # NOTE: carry ``limiter_exclude_indices`` over from the stub
+        # built at Phase 1 — otherwise the final state Zstruct drops
+        # it and ``_apply_slope_limiter`` falls back to an empty
+        # exclude set, re-introducing the b-flicker bug.
         state = Zstruct(
             mesh=mesh,
             runtime_model=runtime_model,
             system_model=system_model,
             runtime_numerics=runtime_numerics,
+            limiter_exclude_indices=limiter_exclude_indices,
             model=model,
             V=V,
             Vaux=Vaux,
@@ -1280,6 +1379,12 @@ class FiredrakeHyperbolicSolver:
 
         execution_time = get_time() - start_time
         logger.info(f"Finished simulation in {execution_time:.3f} seconds")
+        # Expose final iteration count + wall time so a caller can
+        # produce per-step throughput summaries without re-parsing the
+        # log.  Kept on ``_state`` to avoid changing the public method
+        # signature.
+        s.last_iteration_count = int(iteration)
+        s.last_execution_time = float(execution_time)
 
     # ==================================================================
     # Backward-compatible entry point
@@ -1334,10 +1439,13 @@ class FiredrakeHyperbolicSolver:
         UFLRuntimeSymbolic.module["max_wavespeed"] = _max_wavespeed_ufl
         numerics = self.riemann_solver_cls(system_model)
         runtime_numerics = numerics.to_runtime_ufl()
+        limiter_exclude_indices = self._resolve_limiter_exclude_indices(
+            system_model)
         object.__setattr__(self, "_state",
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
-                                   runtime_model=runtime_model))
+                                   runtime_model=runtime_model,
+                                   limiter_exclude_indices=limiter_exclude_indices))
 
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
             self._get_functionspaces(mesh, runtime_model)
