@@ -167,14 +167,39 @@ class FiredrakeHyperbolicSolver:
     # Mesh / geometry helpers
     # ==================================================================
 
-    def get_map_boundary_tag_to_boundary_function_index(self, model, msh_path, mesh):
-        msh = meshio.read(msh_path)
+    def get_map_boundary_tag_to_boundary_function_index(
+            self, model, msh_path, mesh, *, boundary_tag_map=None):
+        """Build ``{physical_id: bc_list_index}`` for the BC weak-form loop.
+
+        Two sources for the ``{tag_name: physical_id}`` resolution:
+
+        - When the caller passed a gmsh ``.msh`` path, parse the named
+          physical groups via ``meshio`` (legacy behaviour).
+        - When the caller passed an in-memory ``fd.MeshGeometry``
+          (``msh_path is None``), require ``boundary_tag_map`` —
+          a ``{tag_name: physical_id}`` dict.  For
+          ``fd.IntervalMesh(N, length=H)`` the conventional markers
+          are ``1`` (left endpoint) and ``2`` (right endpoint); the
+          caller maps these to BC tag names.
+        """
         boundary_function_names = model.boundary_conditions._boundary_tags
-        field_data_raw = msh.field_data  # name -> [id, dim, type]
-        field_data = {
-            name: data for name, data in field_data_raw.items()
-            if name in boundary_function_names
-        }
+        if msh_path is None:
+            # In-memory mesh path: caller supplies the tag map.
+            if boundary_tag_map is None:
+                if boundary_function_names:
+                    return {"__all__": 0}
+                return {}
+            field_data = {
+                name: [pid] for name, pid in boundary_tag_map.items()
+                if name in boundary_function_names
+            }
+        else:
+            msh = meshio.read(msh_path)
+            field_data_raw = msh.field_data  # name -> [id, dim, type]
+            field_data = {
+                name: data for name, data in field_data_raw.items()
+                if name in boundary_function_names
+            }
         extracted_facets_firedrake = mesh.exterior_facets.unique_markers
         assert len(extracted_facets_firedrake) == len(field_data), (
             f"Mismatch in number of boundary tags: "
@@ -1167,7 +1192,7 @@ class FiredrakeHyperbolicSolver:
     # setup_simulation / run_simulation / step
     # ==================================================================
 
-    def setup_simulation(self, mesh_file, model):
+    def setup_simulation(self, mesh_file, model, *, boundary_tag_map=None):
         """Set up all simulation state: mesh, model, spaces, forms, solvers.
 
         Stores state on ``self`` (via ``object.__setattr__`` since the class is
@@ -1175,13 +1200,24 @@ class FiredrakeHyperbolicSolver:
 
         Parameters
         ----------
-        mesh_file : str
-            Path to a Gmsh ``.msh`` file.
+        mesh_file : str or fd.MeshGeometry
+            Either a path to a Gmsh ``.msh`` file (legacy path) **or**
+            an in-memory Firedrake mesh object (e.g. ``fd.IntervalMesh``).
+            When an in-memory mesh is passed, supply ``boundary_tag_map``.
         model : zoomy_core Model
             Symbolic model with flux, source, boundary_conditions, etc.
+        boundary_tag_map : dict[str, int], optional
+            Required when ``mesh_file`` is an in-memory mesh.  Maps each
+            BC tag name (as declared on ``model.boundary_conditions``)
+            to the Firedrake physical-id of its facet group.
         """
         # -- Phase 1: Load mesh, freeze SystemModel, build runtimes --
-        mesh = fd.Mesh(mesh_file)
+        if isinstance(mesh_file, str):
+            mesh = fd.Mesh(mesh_file)
+            mesh_path = mesh_file
+        else:
+            mesh = mesh_file
+            mesh_path = None
         if isinstance(model, SystemModel):
             raise NotImplementedError(
                 "FiredrakeHyperbolicSolver currently requires a Model "
@@ -1253,7 +1289,8 @@ class FiredrakeHyperbolicSolver:
 
         # -- Phase 4: Boundary tag mapping --
         map_boundary_tag_to_function_index = (
-            self.get_map_boundary_tag_to_boundary_function_index(model, mesh_file, mesh)
+            self.get_map_boundary_tag_to_boundary_function_index(
+                model, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
         )
 
         # -- Phase 5: Build weak forms --
@@ -1390,27 +1427,35 @@ class FiredrakeHyperbolicSolver:
     # Backward-compatible entry point
     # ==================================================================
 
-    def solve(self, mshfile, model):
+    def solve(self, mshfile, model, *, boundary_tag_map=None):
         """Run a full simulation: setup + time loop.
 
-        This is the original entry point preserved for backward compatibility.
-        Equivalent to calling ``setup_simulation()`` followed by
-        ``run_simulation()``.
+        Equivalent to ``setup_simulation()`` followed by
+        ``run_simulation()``.  Accepts either a ``.msh`` path or an
+        in-memory ``fd.MeshGeometry`` (passes through to
+        :meth:`setup_simulation`).
         """
-        self.setup_simulation(mshfile, model)
+        self.setup_simulation(mshfile, model, boundary_tag_map=boundary_tag_map)
         self.run_simulation()
 
     # ------------------------------------------------------------------
     # Legacy _setup (kept for AMR subclass compatibility)
     # ------------------------------------------------------------------
 
-    def _setup(self, mshfile, model):
+    def _setup(self, mshfile, model, *, boundary_tag_map=None):
         """Legacy setup returning a tuple of simulation objects.
 
         Prefer ``setup_simulation()`` for new code.  This method is retained
-        so that ``FiredrakeHyperbolicSolverAMR`` continues to work.
+        so that ``FiredrakeHyperbolicSolverAMR`` continues to work.  Same
+        mesh-input semantics as :meth:`setup_simulation` (path or
+        ``fd.MeshGeometry``).
         """
-        mesh = fd.Mesh(mshfile)
+        if isinstance(mshfile, str):
+            mesh = fd.Mesh(mshfile)
+            mesh_path = mshfile
+        else:
+            mesh = mshfile
+            mesh_path = None
         if isinstance(model, SystemModel):
             raise NotImplementedError(
                 "FiredrakeHyperbolicSolver requires a Model instance; "
@@ -1464,7 +1509,8 @@ class FiredrakeHyperbolicSolver:
 
         # Collect all boundary tags
         map_boundary_tag_to_function_index = (
-            self.get_map_boundary_tag_to_boundary_function_index(model, mshfile, mesh)
+            self.get_map_boundary_tag_to_boundary_function_index(
+                model, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
         )
 
         return (mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1,
