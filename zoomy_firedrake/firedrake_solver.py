@@ -344,9 +344,15 @@ class FiredrakeHyperbolicSolver:
     # ==================================================================
 
     def write_state(self, q, qaux, out, time=0.0, names=None):
+        """Write conservative + aux variables to a VTKFile timestep.
+
+        Each component is projected onto a scalar DG(``dg_degree``)
+        space — DG(0) for cell-mean schemes, DG(1)+ for higher-order
+        schemes — so the per-cell solver state is rendered directly
+        in ParaView (no extra smoothing).
+        """
         mesh = q.function_space().mesh()
-        # Always project to DG0 for VTK output regardless of solution degree
-        V_scalar = fd.FunctionSpace(mesh, "DG", 0)
+        V_scalar = fd.FunctionSpace(mesh, "DG", self.dg_degree)
         n_dof_q = q.function_space().value_size
         n_dof_aux = qaux.function_space().value_size
         subfuns = [
