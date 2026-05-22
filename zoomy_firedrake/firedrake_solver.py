@@ -942,6 +942,36 @@ class FiredrakeHyperbolicSolver:
             system_model.field_index(f) for f in self.limiter_exclude_fields
         )
 
+    def _resolve_source_passive_indices(self, system_model) -> frozenset:
+        """Return state indices whose ``source`` entry is symbolically zero.
+
+        Components with a zero source row pass through the source step
+        unchanged in exact arithmetic — but the Newton solve with finite
+        ``snes_rtol`` (1e-6 by default) leaves ~``rtol·|U|`` residual
+        drift on these rows.  For shallow water that means ``h`` (no
+        friction source — source is on ``hu`` / ``hv`` only) drifts by
+        ~1e-7 per step on cells with nonzero mass coupling to momentum,
+        violating bit-for-bit mass conservation and eventually pushing
+        some cell-mean ``h̄`` slightly negative.
+
+        Indices returned here are restored from the pre-source state
+        ``Qs`` immediately after :meth:`step` calls ``solver_source.
+        solve()`` — see :meth:`step`.  Enforces the model's structural
+        fact ``source[i] ≡ 0`` exactly instead of letting Newton's
+        tolerance corrupt it.
+        """
+        src = system_model.source
+        if src is None:
+            return frozenset(range(system_model.n_state))
+        passive = set()
+        for i in range(system_model.n_state):
+            try:
+                if sp.sympify(src[i]) == 0:
+                    passive.add(i)
+            except Exception:
+                continue
+        return frozenset(passive)
+
     def _apply_slope_limiter(self, Q):
         """Apply slope limiter for DG degree >= 1.
 
@@ -1285,11 +1315,14 @@ class FiredrakeHyperbolicSolver:
         # ``self._state.system_model`` / ``self._state.runtime_numerics``.
         limiter_exclude_indices = self._resolve_limiter_exclude_indices(
             system_model)
+        source_passive_indices = self._resolve_source_passive_indices(
+            system_model)
         object.__setattr__(self, "_state",
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model,
-                                   limiter_exclude_indices=limiter_exclude_indices))
+                                   limiter_exclude_indices=limiter_exclude_indices,
+                                   source_passive_indices=source_passive_indices))
 
         # -- Phase 2: Build function spaces --
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
@@ -1347,6 +1380,7 @@ class FiredrakeHyperbolicSolver:
             system_model=system_model,
             runtime_numerics=runtime_numerics,
             limiter_exclude_indices=limiter_exclude_indices,
+            source_passive_indices=source_passive_indices,
             model=model,
             V=V,
             Vaux=Vaux,
@@ -1390,6 +1424,18 @@ class FiredrakeHyperbolicSolver:
 
         # --- Source step (nonlinear Newton solve) ---
         s.solver_source.solve()
+        # Restore source-passive slots (``source[i] ≡ 0`` in the model)
+        # from the convective-step result.  Newton's finite ``snes_rtol``
+        # leaves ~1e-7 drift on these rows otherwise — see
+        # :meth:`_resolve_source_passive_indices`.  For SWE this
+        # enforces exact mass conservation by restoring ``h`` (and the
+        # stationary bathymetry ``b``) bit-for-bit.
+        passive = getattr(s, "source_passive_indices", frozenset())
+        if passive:
+            qnp1_data = s.Qnp1.dat.data
+            qs_data_ro = s.Qs.dat.data_ro
+            for k in passive:
+                qnp1_data[:, k] = qs_data_ro[:, k]
         self._apply_slope_limiter(s.Qnp1)
         self.update_Q(s.Qnp1, s.Qaux_np1, s.runtime_model)
         self.update_Qaux(s.Qnp1, s.Qaux_np1, s.runtime_model)
@@ -1507,11 +1553,14 @@ class FiredrakeHyperbolicSolver:
         runtime_numerics = numerics.to_runtime_ufl()
         limiter_exclude_indices = self._resolve_limiter_exclude_indices(
             system_model)
+        source_passive_indices = self._resolve_source_passive_indices(
+            system_model)
         object.__setattr__(self, "_state",
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model,
-                                   limiter_exclude_indices=limiter_exclude_indices))
+                                   limiter_exclude_indices=limiter_exclude_indices,
+                                   source_passive_indices=source_passive_indices))
 
         V, Vaux, Qnp1, Qs, Qn, Qaux_np1, Qaux_s, Qaux_n = (
             self._get_functionspaces(mesh, runtime_model)
