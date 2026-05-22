@@ -61,7 +61,12 @@ class FiredrakeHyperbolicSolver:
     CFL: float = field(default=0.9)
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
-    limiter: str = field(default="vertex")  # "vertex", "p_weighted", or "none"
+    limiter: str = field(default="vertex")  # "vertex", "p_weighted", "ofdg", or "none"
+    # OFDG (Liu-Lu-Tao-Xia 2022, J. Sci. Comput. 92:79,
+    # doi:10.1007/s10915-022-01893-w) damping coefficient ``β`` for the
+    # ``limiter="ofdg"`` mode.  ``β=1`` matches the paper convention;
+    # raise to dampen ripples more aggressively, drop to under-damp.
+    ofdg_beta: float = field(default=1.0)
     # Fields the slope limiter should **skip** (pass through
     # unmodified).  A list of state-field handles — each accepted by
     # :meth:`SystemModel.field_index`:
@@ -972,6 +977,101 @@ class FiredrakeHyperbolicSolver:
                 continue
         return frozenset(passive)
 
+    def _apply_ofdg_damping(self, Q):
+        """Oscillation-free DG damping per Liu-Lu-Tao-Xia 2022.
+
+        For each non-excluded component ``i`` of ``Q`` (a DG(k) vector
+        function), applies the multiplicative damping
+
+            q_i ← ū_i + α_K · (q_i − ū_i)
+
+        where ``ū_i`` is the cell mean (projection onto DG(0)) and
+        ``α_K = exp(−β · I_K) ∈ (0, 1]`` is a per-cell damping factor
+        built from a dimensionless edge-jump indicator
+
+            I_K = (1 / 3) · Σ_{e ∈ ∂K} |[q_i]|_e  /  max(|ū_i|, ε)
+
+        i.e. the average absolute jump across the three facets of the
+        triangle, normalised by the local magnitude of the cell mean.
+
+        Properties (paper):
+
+        - **Cell-mean-preserving** — vanishes against constants on K so
+          ``∫_K (q_new − q) dx = 0``.  Mass conservation to machine
+          precision.  Composes with any cell-mean positivity scaling.
+        - **Lake-at-rest** — at still steady state ``[q_i]_e = 0`` for
+          all facets, hence ``I_K = 0`` and ``α_K = 1`` (no damping).
+        - **2Δx-mode targeted** — for DG(1) on triangles the projection
+          onto DG(0) is the cell average; the orthogonal complement is
+          spanned by the linear modes, which carry the 2Δx oscillation.
+
+        Known limitation of *this* indicator: the per-cell-magnitude
+        normalisation ``|ū_i|`` makes damping weak in regions of large
+        background mean (e.g. the upstream reservoir at η≈100 m).  The
+        paper's actual indicator uses local *variation* over the
+        cell+neighbours stencil — magnitude-invariant — and is the
+        right next step here.
+
+        ``β = self.ofdg_beta`` is the global damping coefficient.
+        Excluded components (e.g. bathymetry ``b``) pass through
+        unchanged via :attr:`limiter_exclude_indices`.
+        """
+        import numpy as np
+
+        V = Q.function_space()
+        mesh = V.mesh()
+        ncomp = V.value_size
+        s = self._state
+        exclude = getattr(s, "limiter_exclude_indices", frozenset())
+        beta = float(self.ofdg_beta)
+        eps_scale = 1e-12
+
+        DG_p = fd.FunctionSpace(mesh, "DG", self.dg_degree)
+        DG0 = fd.FunctionSpace(mesh, "DG", 0)
+        v0 = fd.TestFunction(DG0)
+
+        # Per-cell area (constant across the run).
+        area_co = fd.assemble(v0 * fd.dx)
+        area = np.array(area_co.dat.data_ro[:], copy=True)
+        area_safe = np.maximum(area, 1e-30)
+        length_scale = np.sqrt(area_safe)
+
+        qi = fd.Function(DG_p)
+        qi_avg = fd.Function(DG0)
+        alpha = fd.Function(DG0)
+        q_damped = fd.Function(DG_p)
+
+        for i in range(ncomp):
+            if i in exclude:
+                continue
+
+            # Pull component i via dat-slice (avoids
+            # VectorFunctionSpace.sub(i) bugs documented in
+            # :meth:`_apply_slope_limiter`).
+            qi.dat.data[:] = Q.dat.data_ro[:, i]
+
+            # Cell average ū_i.
+            avg_co = fd.assemble(v0 * qi * fd.dx)
+            qi_avg.dat.data[:] = avg_co.dat.data_ro[:] / area_safe
+
+            # Per-cell edge-length-weighted sum of |[q_i]| over facets.
+            jump_form = abs(fd.jump(qi)) * (v0('+') + v0('-')) * fd.dS
+            jump_co = fd.assemble(jump_form)
+            jump_sum = np.array(jump_co.dat.data_ro[:], copy=True)
+
+            # Normalise: per-facet magnitude average, length scale =
+            # √|K|, 3 facets per triangle.
+            jump_avg = jump_sum / (length_scale * 3.0)
+
+            # Dimensionless indicator and damping factor.
+            scale = np.maximum(np.abs(qi_avg.dat.data_ro[:]), eps_scale)
+            indicator = jump_avg / scale
+            alpha.dat.data[:] = np.exp(-beta * indicator)
+
+            # Broadcast (DG0 ū, DG0 α) into DG(k) via UFL interp.
+            q_damped.interpolate(qi_avg + alpha * (qi - qi_avg))
+            Q.dat.data[:, i] = q_damped.dat.data_ro[:]
+
     def _apply_slope_limiter(self, Q):
         """Apply slope limiter for DG degree >= 1.
 
@@ -993,11 +1093,21 @@ class FiredrakeHyperbolicSolver:
         - ``"p_weighted"`` -- p-weighted limiter (Li et al. 2020).  Higher-order
           modes are damped more aggressively, preserving accuracy at smooth
           extrema while controlling oscillations at shocks.
+        - ``"ofdg"``       -- Oscillation-free DG damping
+          (Liu-Lu-Tao-Xia 2022, J. Sci. Comput. 92:79,
+          doi:10.1007/s10915-022-01893-w).  Cell-mean-preserving
+          multiplicative damping of the modes orthogonal to the cell
+          mean, weighted by an inter-element-jump indicator.  No slope
+          clipping, mass-conservative by construction, vanishes at
+          lake-at-rest.
         - ``"none"``       -- no limiting.
         """
         if self.dg_degree < 1:
             return
         if self.limiter == "none":
+            return
+        if self.limiter == "ofdg":
+            self._apply_ofdg_damping(Q)
             return
 
         V = Q.function_space()
