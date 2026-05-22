@@ -393,8 +393,12 @@ class FiredrakeHyperbolicSolver:
         x = fd.SpatialCoordinate(mesh)
         coords_func = fd.Function(V_coords).interpolate(fd.as_vector(x))
 
-        # Return as NumPy array (read-only for safety)
-        coords = np.array(coords_func.dat.data_ro)
+        # Return as NumPy array (read-only for safety).
+        # 1D Firedrake meshes give a rank-1 coords array; reshape to
+        # ``(n_dofs, 1)`` so downstream callers always see a 2D layout.
+        coords = np.asarray(coords_func.dat.data_ro)
+        if coords.ndim == 1:
+            coords = coords.reshape(-1, 1)
         assert coords.shape[1] == dim, f"Unexpected coordinate shape {coords.shape}, dim={dim}"
         return coords
 
