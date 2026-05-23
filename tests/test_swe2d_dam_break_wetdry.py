@@ -26,7 +26,7 @@ import zoomy_core.model.boundary_conditions as BC
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.fvm.solver_numpy import Settings
 from zoomy_core.misc.misc import Zstruct
-from zoomy_core.model.models.shallow_water import ShallowWater2D
+from zoomy_core.model.models.swe import SWE
 from zoomy_core.fvm.riemann_solvers import Rusanov
 
 
@@ -59,7 +59,8 @@ def _wetdry_model():
         by = np.zeros_like(x[0])
         return np.stack([b, bx, by], axis=0)
 
-    return ShallowWater2D(
+    return SWE(
+        dimension=2,
         manning_n=0.0,
         nu=0.0,
         g=9.81,
