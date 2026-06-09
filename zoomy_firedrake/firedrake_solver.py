@@ -8,7 +8,7 @@ from zoomy_core.fvm.solver_numpy import Settings
 from attrs import field, define
 from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.fvm.riemann_solvers import Rusanov
 from zoomy_firedrake.firedrake_compat import (
     safe_extract_component, safe_assign_component,
