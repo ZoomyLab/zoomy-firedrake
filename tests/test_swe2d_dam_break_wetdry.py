@@ -26,7 +26,7 @@ import zoomy_core.model.boundary_conditions as BC
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.fvm.solver_numpy import Settings
 from zoomy_core.misc.misc import Zstruct
-from zoomy_core.model.models.swe import SWE
+from zoomy_firedrake.firedrake_compat import SWE
 from zoomy_core.fvm.riemann_solvers import Rusanov
 
 

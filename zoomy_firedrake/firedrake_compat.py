@@ -131,3 +131,28 @@ def safe_assign_component(
         Index ``0 ≤ component_index < N`` of the vector component to write.
     """
     target_vector.dat.data[:, component_index] = source_scalar.dat.data_ro[:]
+
+
+# ── Legacy-model compat ──────────────────────────────────────────────
+#
+# The dim-generic ``SWE`` lives in ``zoomy_core.model.models.legacy``
+# and still reads ``self._parameter_symbols`` — an attribute of the
+# PRE-restructure basemodel (the parameter-SYMBOL Zstruct, while
+# ``parameters`` held numeric values).  The post-restructure basemodel
+# stores the symbols directly in ``parameters``, so the alias below is
+# exact.  Kept here (not in zoomy_core) so the legacy tree stays
+# untouched.
+
+def _make_legacy_swe():
+    from zoomy_core.model.models.legacy.swe import SWE as _LegacySWE
+
+    class SWE(_LegacySWE):
+        @property
+        def _parameter_symbols(self):
+            return self.parameters
+
+    SWE.__name__ = "SWE"
+    return SWE
+
+
+SWE = _make_legacy_swe()
