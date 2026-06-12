@@ -62,6 +62,11 @@ class FiredrakeHyperbolicSolver:
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
     limiter: str = field(default="vertex")  # "vertex", "p_weighted", "ofdg", or "none"
+    # Zhang-Shu positivity-preserving θ-scaling of the water height
+    # (Xing-Zhang-Shu 2010), applied AFTER the oscillation limiter.
+    # Mean-preserving (no mass change, no truncation).  DG(1) only.
+    positivity_limiter: bool = field(default=False)
+    positivity_limiter_fields: tuple = field(default=("h",))
     # OFDG (Liu-Lu-Tao-Xia 2022, J. Sci. Comput. 92:79,
     # doi:10.1007/s10915-022-01893-w) damping coefficient ``β`` for the
     # ``limiter="ofdg"`` mode.  ``β=1`` matches the paper convention;
@@ -1226,9 +1231,11 @@ class FiredrakeHyperbolicSolver:
         if self.dg_degree < 1:
             return
         if self.limiter == "none":
+            self._apply_positivity_scaling(Q)
             return
         if self.limiter == "ofdg":
             self._apply_ofdg_damping(Q)
+            self._apply_positivity_scaling(Q)
             return
 
         V = Q.function_space()
@@ -1305,6 +1312,66 @@ class FiredrakeHyperbolicSolver:
             limited[i] = qi
         for i, qi in limited.items():
             safe_assign_component(Q, qi, i)
+        self._apply_positivity_scaling(Q)
+
+    def _apply_positivity_scaling(self, Q):
+        """Zhang-Shu positivity-preserving θ-scaling of the water
+        height (Xing, Zhang & Shu 2010, Adv. Water Resour. 33:1476).
+
+        Per cell: ``h ← h̄ + θ (h − h̄)`` with
+        ``θ = min(1, h̄ / (h̄ − h_min))`` where ``h_min`` is the minimum
+        nodal value, so the scaled polynomial satisfies ``h ≥ 0`` at
+        every node while the cell mean — and hence total mass — is
+        UNCHANGED.  This is a linear-in-state rescaling, NOT a
+        truncation: no water is created or destroyed (the audited
+        no-truncation property is preserved).  Cells whose MEAN is
+        already ≤ 0 collapse to their (honest, possibly negative) mean
+        (θ = 0) — cell-mean positivity itself is the Riemann solver's
+        job (Rusanov/LF + Audusse per Xing-Zhang 2013; out of scope
+        for HLL).
+
+        Implemented for nodal DG(1) on simplices, where the cell mean
+        equals the arithmetic mean of the vertex nodal values.  No-op
+        unless ``self.positivity_limiter`` and ``dg_degree == 1``.
+        """
+        if not self.positivity_limiter or self.dg_degree != 1:
+            return
+        s = self._state
+        # Resolve (and cache) the index of the water-height component.
+        h_idx = getattr(s, "_pp_h_index", None)
+        if h_idx is None:
+            names = [str(v) for v in s.system_model.variables.get_list()]
+            matches = [i for i, nm in enumerate(names)
+                       if nm in self.positivity_limiter_fields]
+            if not matches:
+                s._pp_h_index = -1
+                return
+            h_idx = matches[0]
+            s._pp_h_index = h_idx
+        if h_idx < 0:
+            return
+        V_scalar = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
+        conn = getattr(s, "_pp_cell_nodes", None)
+        if conn is None:
+            conn = V_scalar.cell_node_map().values
+            s._pp_cell_nodes = conn
+        data = Q.dat.data
+        vals = data[conn, h_idx]                      # (ncells, 3)
+        mean = vals.mean(axis=1)
+        hmin = vals.min(axis=1)
+        denom = mean - hmin
+        with np.errstate(divide="ignore", invalid="ignore"):
+            theta = np.where(
+                hmin < 0.0,
+                np.where(mean > 0.0,
+                         np.minimum(1.0, mean / np.where(
+                             denom > 0.0, denom, 1.0)),
+                         0.0),
+                1.0)
+        if float(theta.min()) >= 1.0:
+            return
+        data[conn, h_idx] = mean[:, None] \
+            + theta[:, None] * (vals - mean[:, None])
 
     # ==================================================================
     # Solver construction
