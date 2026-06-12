@@ -469,24 +469,43 @@ class FiredrakeHyperbolicSolver:
         # each DOF inside that cell during ``interpolate``.
         V_dt = fd.FunctionSpace(mesh, "DG", degree)
         dt_local = fd.Function(V_dt)
-        h_cd = fd.CellDiameter(mesh)
+        # Cell size: smallest altitude ``2·|K| / d_longest`` (for a
+        # simplex), NOT the longest edge.  ``CellDiameter`` overstates
+        # the stable step on skewed triangles by the cell aspect ratio
+        # — measured on the Malpasset mesh: dt 3.5× the numpy backend's
+        # (which uses 2·inradius), driving a boundary-cell instability
+        # that rectified into spurious bank pile-up (η grew to 174 m
+        # against a 100 m reservoir; at dt parity the pockets stay at
+        # ≤ runup levels, matching the numpy cross-check).
+        if dim == 1:
+            h_sz = fd.CellDiameter(mesh)
+        else:
+            h_sz = 2.0 * fd.CellVolume(mesh) / fd.CellDiameter(mesh)
+
+        # Wave-speed sampling: axis normals alone underestimate
+        # ``max_n |u·n| + c`` by up to √2 for diagonal flow — include
+        # the diagonals in 2D.
+        if dim == 1:
+            normals = [fd.as_vector([1.0])]
+        else:
+            s = 1.0 / np.sqrt(2.0)
+            normals = [
+                fd.as_vector([1.0, 0.0]),
+                fd.as_vector([0.0, 1.0]),
+                fd.as_vector([s, s]),
+                fd.as_vector([s, -s]),
+            ]
 
         def compute_dt(Q, Qaux):
             """Compute global stable dt for the given fields Q and Qaux."""
+            lam = self.max_abs_eigenvalue(model, Q, Qaux, normals[0], mesh)
+            for n_vec in normals[1:]:
+                lam = ufl.max_value(
+                    lam,
+                    self.max_abs_eigenvalue(model, Q, Qaux, n_vec, mesh))
             dt_expr = (
-                CFL * h_cd
-                / (
-                    dim_factor * degree_factor
-                    * ufl.max_value(
-                        self.max_abs_eigenvalue(
-                            model, Q, Qaux,
-                            fd.as_vector([1.0, 0.0]), mesh),
-                        self.max_abs_eigenvalue(
-                            model, Q, Qaux,
-                            fd.as_vector([0.0, 1.0]), mesh),
-                    )
-                    + 1e-8
-                )
+                CFL * h_sz
+                / (dim_factor * degree_factor * lam + 1e-8)
             )
             dt_local.interpolate(dt_expr)
             dt_min = float(np.min(dt_local.dat.data_ro))
