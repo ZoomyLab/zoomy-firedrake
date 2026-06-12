@@ -67,15 +67,17 @@ class FiredrakeHyperbolicSolver:
     # Mean-preserving (no mass change, no truncation).  DG(1) only.
     positivity_limiter: bool = field(default=False)
     positivity_limiter_fields: tuple = field(default=("h",))
-    # Equilibrium-variable (free-surface) limiting: slope-limit the free
-    # surface η = h + b instead of the conservative water height h, then
-    # recover h = η − b.  At lake-at-rest η is constant, so the limiter is
-    # inert (Xing-Zhang-Shu 2010; Kurganov 2018 review, Acta Numerica —
-    # "the well-balanced property … is enforced by reconstructing
-    # equilibrium variables").  Removes the well-balancing defect where a
-    # limiter keyed on raw h corrupts the flat surface at the wet/dry
-    # shoreline (water creeping up the walls).  Requires a free-surface
-    # model exposing fields named "h" and "b"; a safe no-op otherwise.
+    # Reconstruction limiting: slope-limit the MODEL's primitive
+    # well-balanced reconstruction variables (``reconstruction_variables`` —
+    # e.g. the free surface η = b + h) instead of the conservative state,
+    # then map back via the model's ``state_from_reconstruction``.  At
+    # lake-at-rest η is constant, so the limiter is inert and does not
+    # corrupt the flat surface (the "water creeping up the walls" wet/dry
+    # defect; Xing-Zhang-Shu 2010; Kurganov 2018 — "reconstruct equilibrium
+    # variables").  The forward/inverse maps are the model's OWN symbolic
+    # functions, lowered to UFL by codegen — pure sympy, no numpy, no
+    # field-index assumptions, identical for every backend.  A transparent
+    # no-op for models that declare no non-trivial reconstruction map.
     surface_limiting: bool = field(default=False)
     # OFDG (Liu-Lu-Tao-Xia 2022, J. Sci. Comput. 92:79,
     # doi:10.1007/s10915-022-01893-w) damping coefficient ``β`` for the
@@ -1234,59 +1236,71 @@ class FiredrakeHyperbolicSolver:
             q_damped.interpolate(qi_avg + alpha * (qi - qi_avg))
             Q.dat.data[:, i] = q_damped.dat.data_ro[:]
 
-    def _surface_indices(self):
-        """``(h_idx, b_idx)`` for free-surface limiting, cached on ``_state``.
+    def _reconstruct_in(self, Q, Qaux):
+        """Transform the conservative state into the MODEL's primitive
+        well-balanced reconstruction variables (e.g. free surface
+        ``η = b + h``, modal velocities) so the oscillation limiter operates
+        on the equilibrium quantities — inert at lake-at-rest, no spurious
+        flat-surface corruption ("water creeping up the walls").
 
-        ``h`` is the water-height field, ``b`` the bathymetry.  Resolved by
-        field name; ``b`` falls back to the model's first stationary index.
-        Returns ``(-1, -1)`` when the model has no free surface, so
-        :attr:`surface_limiting` degrades to a safe no-op.
-        """
-        s = self._state
-        cached = getattr(s, "_surf_indices", None)
-        if cached is not None:
-            return cached
-        names = [str(v) for v in s.system_model.variables.get_list()]
+        The forward map ``reconstruction_variables`` and its inverse
+        ``state_from_reconstruction`` are the model's OWN symbolic functions
+        (pure sympy, resolved by field NAME), lowered to UFL by codegen — no
+        numpy, no hard-coded field indices, identical for every backend.
+        For ``η = b + h`` the transform is linear, hence exact in the DG
+        space (no projection error).
 
-        def _find(cands):
-            for i, nm in enumerate(names):
-                if nm in cands:
-                    return i
-            return -1
-
-        h_idx = _find(("h",))
-        b_idx = _find(("b",))
-        if b_idx < 0:
-            st = sorted(s.system_model.stationary_indices)
-            b_idx = st[0] if st else -1
-        res = (h_idx, b_idx)
-        s._surf_indices = res
-        return res
-
-    def _surface_shift_in(self, Q):
-        """Add ``b`` into the ``h`` slot so the limiter sees η = h + b.
-
-        Returns the ``(h_idx, b_idx)`` pair if the shift was applied (for
-        :meth:`_surface_shift_out` to undo), else ``None``.
+        Returns ``(W, Qaux)`` with ``W`` a fresh Function holding the
+        reconstruction variables, or ``(Q, None)`` when reconstruction
+        limiting is off / unavailable — a transparent no-op in which the
+        limiter just acts on the conservative state ``Q`` directly.
         """
         if not self.surface_limiting:
-            return None
-        h_idx, b_idx = self._surface_indices()
-        if h_idx < 0 or b_idx < 0 or h_idx == b_idx:
-            return None
-        data = Q.dat.data
-        data[:, h_idx] += data[:, b_idx]
-        return (h_idx, b_idx)
+            return Q, None
+        s = self._state
+        rm = getattr(s, "runtime_model", None)
+        sm = getattr(s, "system_model", None)
+        if rm is None or Qaux is None or sm is None \
+                or getattr(sm, "reconstruction_variables", None) is None:
+            return Q, None
+        W = fd.Function(Q.function_space())
+        W.interpolate(rm.reconstruction_variables(Q, Qaux, rm.parameters))
+        return W, Qaux
 
-    def _surface_shift_out(self, Q, shift):
-        """Undo :meth:`_surface_shift_in` — recover h = η − b."""
-        if not shift:
+    def _reconstruct_out(self, Q, W, Qaux):
+        """Invert :meth:`_reconstruct_in`: write the conservative state back
+        into ``Q`` from the limited reconstruction variables ``W`` via the
+        model's symbolic ``state_from_reconstruction`` (UFL).  No-op when
+        ``Qaux`` is ``None`` (reconstruction was not applied).
+
+        The inverse map is parameterised by fresh ``WB_<state_name>``
+        symbols (one per slot, in slot order — see
+        ``zoomy_core.model.reconstruction_inverse``), NOT the ordinary
+        ``(Q, Qaux, p)`` scope of the forward map.  So it is lambdified
+        against those WB symbols (matching the numpy FVM path,
+        ``solver_chorin_vam_numpy``) and called with ``W``'s components.
+        Lowered through the model's UFL module — pure sympy, no numpy,
+        no field-index assumptions.  Cached on ``_state``.
+        """
+        if Qaux is None:
             return
-        h_idx, b_idx = shift
-        data = Q.dat.data
-        data[:, h_idx] -= data[:, b_idx]
+        s = self._state
+        inv_fn = getattr(s, "_state_from_recon_ufl", None)
+        if inv_fn is None:
+            sm = s.system_model
+            rm = s.runtime_model
+            inv = list(sm.state_from_reconstruction)
+            state_syms = list(getattr(sm, "state", None)
+                              or sm.variables.get_list())
+            wb_syms = [sp.Symbol(f"WB_{ss.name}", real=True)
+                       for ss in state_syms]
+            inv_fn = sp.lambdify(wb_syms, inv, modules=[rm.module])
+            s._state_from_recon_ufl = inv_fn
+        ncomp = W.function_space().value_size
+        Wc = [W[i] for i in range(ncomp)]
+        Q.interpolate(fd.as_vector(list(inv_fn(*Wc))))
 
-    def _apply_slope_limiter(self, Q):
+    def _apply_slope_limiter(self, Q, Qaux=None):
         """Apply slope limiter for DG degree >= 1.
 
         For vector function spaces the limiter is applied component-wise
@@ -1318,21 +1332,25 @@ class FiredrakeHyperbolicSolver:
         """
         if self.dg_degree < 1:
             return
-        # Free-surface limiting: shift h → η = h + b so the oscillation
-        # limiter operates on the equilibrium variable (inert at rest),
-        # then recover h before the positivity scaling.
-        shift = self._surface_shift_in(Q)
+        # Reconstruction limiting: limit the model's primitive well-balanced
+        # variables (free surface η = b + h, …) instead of the conservative
+        # state, via the model's own symbolic reconstruction map (UFL — no
+        # numpy / field-index assumptions).  ``W`` aliases ``Q`` when
+        # reconstruction limiting is off, so the limiter body is one path;
+        # the conservative state is recovered by ``_reconstruct_out`` before
+        # the (mass-preserving) positivity scaling acts on the true ``h``.
+        W, recon_aux = self._reconstruct_in(Q, Qaux)
         if self.limiter == "none":
-            self._surface_shift_out(Q, shift)
+            self._reconstruct_out(Q, W, recon_aux)
             self._apply_positivity_scaling(Q)
             return
         if self.limiter == "ofdg":
-            self._apply_ofdg_damping(Q)
-            self._surface_shift_out(Q, shift)
+            self._apply_ofdg_damping(W)
+            self._reconstruct_out(Q, W, recon_aux)
             self._apply_positivity_scaling(Q)
             return
 
-        V = Q.function_space()
+        V = W.function_space()
         mesh = V.mesh()
         ncomp = V.value_size
 
@@ -1401,12 +1419,12 @@ class FiredrakeHyperbolicSolver:
             if i in exclude:
                 continue
             qi = fd.Function(V_scalar)
-            safe_extract_component(qi, Q, i)
+            safe_extract_component(qi, W, i)
             limiter.apply(qi)
             limited[i] = qi
         for i, qi in limited.items():
-            safe_assign_component(Q, qi, i)
-        self._surface_shift_out(Q, shift)
+            safe_assign_component(W, qi, i)
+        self._reconstruct_out(Q, W, recon_aux)
         self._apply_positivity_scaling(Q)
 
     def _apply_positivity_scaling(self, Q):
@@ -1811,7 +1829,7 @@ class FiredrakeHyperbolicSolver:
 
         # --- Convective step (linear solve) ---
         s.solver_convective.solve()
-        self._apply_slope_limiter(s.Qs)
+        self._apply_slope_limiter(s.Qs, s.Qaux_s)
         self.update_Q(s.Qs, s.Qaux_s, s.runtime_model)
         self.update_Qaux(s.Qs, s.Qaux_s, s.runtime_model)
 
@@ -1829,7 +1847,7 @@ class FiredrakeHyperbolicSolver:
             qs_data_ro = s.Qs.dat.data_ro
             for k in passive:
                 qnp1_data[:, k] = qs_data_ro[:, k]
-        self._apply_slope_limiter(s.Qnp1)
+        self._apply_slope_limiter(s.Qnp1, s.Qaux_np1)
         self.update_Q(s.Qnp1, s.Qaux_np1, s.runtime_model)
         self.update_Qaux(s.Qnp1, s.Qaux_np1, s.runtime_model)
 
