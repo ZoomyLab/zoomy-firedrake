@@ -608,6 +608,34 @@ class FiredrakeHyperbolicSolver:
                 )
             ) * ds_measure
 
+        # --- DG(1+) volume terms.  For dg_degree ≥ 1 the in-cell test
+        # gradient is nonzero and the standard DG form needs, per cell,
+        #   −∫ (F + P) : ∇v dx          (conservative volume flux)
+        #   +∫ v · (B · ∇Q) dx          (interior NCP, path-conservative)
+        # on top of the facet terms above.  At DG(0) both vanish
+        # identically (∇v = ∇Q = 0 inside cells) — without them DG(1)
+        # in-cell DOFs feel no pressure/bed forcing at all (observed:
+        # the Malpasset dam-break jump never starts to move at DG(1)).
+        # This mirrors the cell-interior NCP integral of the order-2
+        # numpy/jax FVM path (solver_numpy `_limited_grad` NCP).
+        if self.dg_degree >= 1:
+            sm_vol = self._state.system_model
+            gdim = mesh.geometric_dimension
+            grad_v = fd.grad(test_q)        # (n_eq,    gdim)
+            grad_Q = fd.grad(Q)             # (n_state, gdim)
+            F_slabs = self._build_flux_pressure_slabs(
+                sm_vol, Q, Qaux, runtime_model)
+            for d in range(gdim):
+                weak_form -= fd.dot(F_slabs[d], grad_v[:, d]) * fd.dx
+            ncp_nonzero = any(
+                e != 0 for e in sp.flatten(sm_vol.nonconservative_matrix))
+            if ncp_nonzero:
+                B_slabs = self._build_ncp_slabs(
+                    sm_vol, Q, Qaux, runtime_model)
+                for d in range(gdim):
+                    weak_form += fd.dot(
+                        test_q, B_slabs[d] * grad_Q[:, d]) * fd.dx
+
         # --- Explicit IMEX slot: ``diffusion_matrix_explicit`` →
         # evaluated at Qn here.  The implicit ``diffusion_matrix`` slot
         # is added inside the source step at Qnp1 (see
@@ -873,6 +901,80 @@ class FiredrakeHyperbolicSolver:
         # of the "+" cell gives ``-∫_f F̂·n("+") · [v] dS``.  In the
         # TPFA approximation F̂·n("+") ≈ M_avg · [Q] / d_face.
         return -fd.dot(jump_v, flux_face) * fd.dS
+
+    @staticmethod
+    def _build_flux_pressure_slabs(sm, Q_side, Qaux_side, runtime_model):
+        """Lambdify ``flux + hydrostatic_pressure`` per direction ``d``
+        through the UFL module.  Returns ``F_slabs[d]`` — each an
+        ``(n_eq,)`` UFL vector — for the DG(1+) volume term
+        ``−∫ (F+P) : ∇v dx``.  Same slab pattern as
+        :meth:`_build_diffusion_slabs`."""
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.basefunction import Function
+
+        std_sig = Zstruct(variables=sm.variables,
+                          aux_variables=sm.aux_variables,
+                          parameters=sm.parameters)
+        n_eq = sm.n_equations
+        gdim = sm.n_dim
+
+        slabs = []
+        for d in range(gdim):
+            slab_expr = sp.Matrix(
+                n_eq, 1,
+                lambda i, _, _d=d: (sm.flux[i, _d]
+                                    + sm.hydrostatic_pressure[i, _d]),
+            )
+            fn = Function(
+                name=f"flux_pressure__d{d}",
+                args=std_sig,
+                definition=slab_expr,
+            )
+            callable_fn = runtime_model._lambdify_function(
+                fn, [runtime_model.module])
+            raw = callable_fn(Q_side, Qaux_side, runtime_model.parameters)
+            # The lambdified (n_eq, 1) sympy Matrix comes back as a
+            # rank-2 UFL tensor — collapse it to an (n_eq,) vector.
+            if getattr(raw, "ufl_shape", None) == (n_eq, 1):
+                vec = fd.as_vector([raw[i, 0] for i in range(n_eq)])
+            else:
+                vec = fd.as_vector([raw[i] for i in range(n_eq)])
+            slabs.append(vec)
+        return slabs
+
+    @staticmethod
+    def _build_ncp_slabs(sm, Q_side, Qaux_side, runtime_model):
+        """Lambdify ``nonconservative_matrix[:, :, d]`` per direction
+        ``d`` through the UFL module.  Returns ``B_slabs[d]`` — each an
+        ``(n_eq, n_state)`` UFL tensor — for the DG(1+) interior NCP
+        term ``+∫ v · (B · ∇Q) dx``."""
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.basefunction import Function
+
+        B_tensor = sm.nonconservative_matrix
+        std_sig = Zstruct(variables=sm.variables,
+                          aux_variables=sm.aux_variables,
+                          parameters=sm.parameters)
+        n_eq = sm.n_equations
+        n_st = sm.n_state
+        gdim = sm.n_dim
+
+        slabs = []
+        for d in range(gdim):
+            slab_expr = sp.Matrix(
+                n_eq, n_st,
+                lambda i, j, _d=d: B_tensor[i, j, _d],
+            )
+            fn = Function(
+                name=f"ncp__d{d}",
+                args=std_sig,
+                definition=slab_expr,
+            )
+            callable_fn = runtime_model._lambdify_function(
+                fn, [runtime_model.module])
+            slabs.append(
+                callable_fn(Q_side, Qaux_side, runtime_model.parameters))
+        return slabs
 
     @staticmethod
     def _build_diffusion_slabs(sm, Q_side, Qaux_side, runtime_model,
