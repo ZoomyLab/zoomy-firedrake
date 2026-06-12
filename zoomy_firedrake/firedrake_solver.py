@@ -67,6 +67,16 @@ class FiredrakeHyperbolicSolver:
     # Mean-preserving (no mass change, no truncation).  DG(1) only.
     positivity_limiter: bool = field(default=False)
     positivity_limiter_fields: tuple = field(default=("h",))
+    # Equilibrium-variable (free-surface) limiting: slope-limit the free
+    # surface η = h + b instead of the conservative water height h, then
+    # recover h = η − b.  At lake-at-rest η is constant, so the limiter is
+    # inert (Xing-Zhang-Shu 2010; Kurganov 2018 review, Acta Numerica —
+    # "the well-balanced property … is enforced by reconstructing
+    # equilibrium variables").  Removes the well-balancing defect where a
+    # limiter keyed on raw h corrupts the flat surface at the wet/dry
+    # shoreline (water creeping up the walls).  Requires a free-surface
+    # model exposing fields named "h" and "b"; a safe no-op otherwise.
+    surface_limiting: bool = field(default=False)
     # OFDG (Liu-Lu-Tao-Xia 2022, J. Sci. Comput. 92:79,
     # doi:10.1007/s10915-022-01893-w) damping coefficient ``β`` for the
     # ``limiter="ofdg"`` mode.  ``β=1`` matches the paper convention;
@@ -1224,6 +1234,58 @@ class FiredrakeHyperbolicSolver:
             q_damped.interpolate(qi_avg + alpha * (qi - qi_avg))
             Q.dat.data[:, i] = q_damped.dat.data_ro[:]
 
+    def _surface_indices(self):
+        """``(h_idx, b_idx)`` for free-surface limiting, cached on ``_state``.
+
+        ``h`` is the water-height field, ``b`` the bathymetry.  Resolved by
+        field name; ``b`` falls back to the model's first stationary index.
+        Returns ``(-1, -1)`` when the model has no free surface, so
+        :attr:`surface_limiting` degrades to a safe no-op.
+        """
+        s = self._state
+        cached = getattr(s, "_surf_indices", None)
+        if cached is not None:
+            return cached
+        names = [str(v) for v in s.system_model.variables.get_list()]
+
+        def _find(cands):
+            for i, nm in enumerate(names):
+                if nm in cands:
+                    return i
+            return -1
+
+        h_idx = _find(("h",))
+        b_idx = _find(("b",))
+        if b_idx < 0:
+            st = sorted(s.system_model.stationary_indices)
+            b_idx = st[0] if st else -1
+        res = (h_idx, b_idx)
+        s._surf_indices = res
+        return res
+
+    def _surface_shift_in(self, Q):
+        """Add ``b`` into the ``h`` slot so the limiter sees η = h + b.
+
+        Returns the ``(h_idx, b_idx)`` pair if the shift was applied (for
+        :meth:`_surface_shift_out` to undo), else ``None``.
+        """
+        if not self.surface_limiting:
+            return None
+        h_idx, b_idx = self._surface_indices()
+        if h_idx < 0 or b_idx < 0 or h_idx == b_idx:
+            return None
+        data = Q.dat.data
+        data[:, h_idx] += data[:, b_idx]
+        return (h_idx, b_idx)
+
+    def _surface_shift_out(self, Q, shift):
+        """Undo :meth:`_surface_shift_in` — recover h = η − b."""
+        if not shift:
+            return
+        h_idx, b_idx = shift
+        data = Q.dat.data
+        data[:, h_idx] -= data[:, b_idx]
+
     def _apply_slope_limiter(self, Q):
         """Apply slope limiter for DG degree >= 1.
 
@@ -1256,11 +1318,17 @@ class FiredrakeHyperbolicSolver:
         """
         if self.dg_degree < 1:
             return
+        # Free-surface limiting: shift h → η = h + b so the oscillation
+        # limiter operates on the equilibrium variable (inert at rest),
+        # then recover h before the positivity scaling.
+        shift = self._surface_shift_in(Q)
         if self.limiter == "none":
+            self._surface_shift_out(Q, shift)
             self._apply_positivity_scaling(Q)
             return
         if self.limiter == "ofdg":
             self._apply_ofdg_damping(Q)
+            self._surface_shift_out(Q, shift)
             self._apply_positivity_scaling(Q)
             return
 
@@ -1338,6 +1406,7 @@ class FiredrakeHyperbolicSolver:
             limited[i] = qi
         for i, qi in limited.items():
             safe_assign_component(Q, qi, i)
+        self._surface_shift_out(Q, shift)
         self._apply_positivity_scaling(Q)
 
     def _apply_positivity_scaling(self, Q):
