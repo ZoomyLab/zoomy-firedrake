@@ -845,22 +845,48 @@ class FiredrakeHyperbolicSolver:
         )
         face_form -= fd.dot(avg_Fn, jump_v) * fd.dS
 
-        # Symmetry: -∫ avg(A·∇v·n) · [Q] dS
+        # Symmetry: -∫ [Q]_j · Σ_{i,d,e} A[i,j,d,e] ∂_e v_i n_d dS —
+        # the TEST function pairs with A's EQUATION index i, the state
+        # jump with the STATE index j (transposed contraction; matters
+        # because A is not symmetric in (i,j) — e.g. the −ν·u cross
+        # term A[hu, h]).
         gv_plus = fd.grad(test_q("+"))
         gv_minus = fd.grad(test_q("-"))
         Av_plus = sum(
-            sum(A_plus[d][e] * gv_plus[:, e] for e in range(gdim)) * n_plus[d]
-            for d in range(gdim)
+            fd.dot(fd.transpose(A_plus[d][e]), gv_plus[:, e]) * n_plus[d]
+            for d in range(gdim) for e in range(gdim)
         )
         Av_minus = sum(
-            sum(A_minus[d][e] * gv_minus[:, e] for e in range(gdim)) * n_plus[d]
-            for d in range(gdim)
+            fd.dot(fd.transpose(A_minus[d][e]), gv_minus[:, e]) * n_plus[d]
+            for d in range(gdim) for e in range(gdim)
         )
         face_form -= 0.5 * fd.dot(Av_plus + Av_minus, jump_Q) * fd.dS
 
-        # Penalty: +∫ (σ / avg_h) · [Q] · [v] dS
+        # Penalty: +∫ (σ / avg_h) · ([v] · M_avg · [Q]) dS with the
+        # normal-contracted diffusion tensor M[i,j] = Σ_{d,e}
+        # A[i,j,d,e] n_d n_e (same contraction as the TPFA branch).
+        #
+        # The penalty MUST be weighted by A: the previous unweighted
+        # σ/h·[Q]·[v] glued ALL components toward interface continuity
+        # with O(σ/h) strength independent of ν — including bathymetry
+        # b and depth h, which carry no diffusion.  A curved bathymetry
+        # sampled at DG nodes is legitimately DISCONTINUOUS across
+        # faces, so the unweighted penalty injected O(1) forcing into
+        # the b and h equations every step (bump-suite probe at the
+        # lake-at-rest IC: ∫|[b]|dS = 0.29, penalty residual 3.9e-2 on
+        # exactly the b,h rows, zero on momentum, with ν = 1e-12) —
+        # corrupting the topography and destroying the rest state
+        # ("water flowing in unreasonable directions" on Malpasset
+        # DG1).  M-weighted, undiffused components get ZERO penalty and
+        # diffused ones scale with ν, as SIPG requires.
+        def _normal_contract_pen(A_side):
+            return sum(A_side[d][e] * n_plus[d] * n_plus[e]
+                       for d in range(gdim) for e in range(gdim))
+
+        M_avg = 0.5 * (_normal_contract_pen(A_plus)
+                       + _normal_contract_pen(A_minus))
         avg_h = (h_F("+") + h_F("-")) / 2.0
-        face_form += (sigma / avg_h) * fd.dot(jump_Q, jump_v) * fd.dS
+        face_form += (sigma / avg_h) * fd.dot(M_avg * jump_Q, jump_v) * fd.dS
 
         return vol_form + face_form
 
