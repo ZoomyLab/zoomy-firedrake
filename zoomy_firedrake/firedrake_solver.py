@@ -94,7 +94,11 @@ class FiredrakeHyperbolicSolver:
     # enabled).
     dt_halving: bool = field(default=False)
     max_dt_halvings: int = field(default=12)
-    cellmean_tol: float = field(default=1e-12)
+    # Accept a cell mean as non-negative within this absolute tolerance: a
+    # tiny residual (~1e-10 m, i.e. ~1e-12 relative to a metres-deep flow) is
+    # roundoff at the wet/dry edge, not a real positivity failure — chasing it
+    # to exactly ≥0 just burns halvings against floating-point noise.
+    cellmean_tol: float = field(default=1e-8)
     # Fields the slope limiter should **skip** (pass through
     # unmodified).  A list of state-field handles — each accepted by
     # :meth:`SystemModel.field_index`:

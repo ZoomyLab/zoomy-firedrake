@@ -133,26 +133,28 @@ def safe_assign_component(
     target_vector.dat.data[:, component_index] = source_scalar.dat.data_ro[:]
 
 
-# ── Legacy-model compat ──────────────────────────────────────────────
+# ── Legacy-model compat (LAZY) ───────────────────────────────────────
 #
-# The dim-generic ``SWE`` lives in ``zoomy_core.model.models.legacy``
-# and still reads ``self._parameter_symbols`` — an attribute of the
-# PRE-restructure basemodel (the parameter-SYMBOL Zstruct, while
-# ``parameters`` held numeric values).  The post-restructure basemodel
-# stores the symbols directly in ``parameters``, so the alias below is
-# exact.  Kept here (not in zoomy_core) so the legacy tree stays
-# untouched.
-
-def _make_legacy_swe():
-    from zoomy_core.model.models.legacy.swe import SWE as _LegacySWE
-
-    class SWE(_LegacySWE):
-        @property
-        def _parameter_symbols(self):
-            return self.parameters
-
-    SWE.__name__ = "SWE"
-    return SWE
+# The dim-generic legacy ``SWE`` (state ``[h, hu, hv]``, bathymetry carried
+# in AUX) is still the fixture for a few SWE2D solver tests.  It is exposed
+# LAZILY via the module ``__getattr__`` (PEP 562): ``from firedrake_compat
+# import SWE`` loads it on demand, but importing this module for the
+# ``safe_*_component`` helpers — the DG(0)/DG(1) SOLVER path — does NOT pull
+# ``zoomy_core.model.models.legacy``, so the solver path stays legacy-free.
+# New code should use the canonical ``zoomy_core.model.models`` SWE /
+# MalpassetSWE (state ``[b, h, hu, hv]``); the 3 legacy SWE2D tests need an
+# IC/assertion rewrite to migrate (different state layout) — tracked separately.
 
 
-SWE = _make_legacy_swe()
+def __getattr__(name):
+    if name == "SWE":
+        from zoomy_core.model.models.legacy.swe import SWE as _LegacySWE
+
+        class SWE(_LegacySWE):
+            @property
+            def _parameter_symbols(self):
+                return self.parameters
+
+        SWE.__name__ = "SWE"
+        return SWE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
