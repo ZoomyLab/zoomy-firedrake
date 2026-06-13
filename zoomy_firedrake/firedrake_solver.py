@@ -1911,10 +1911,24 @@ class FiredrakeHyperbolicSolver:
                 s.Qnp1.assign(s._dt_halve_save)  # roll back to time n
                 s.Qaux_np1.assign(s._dt_halve_save_aux)
                 dt_try *= 0.5
-        logger.warning(
-            f"dt-halving floor hit ({self.max_dt_halvings} halvings): cell-mean "
-            f"h still {self._min_cell_mean_h(s.Qnp1):.3e} at dt={dt_try:.3e}")
-        return dt_try
+        # Floor hit: halving did NOT restore positivity, so this is a
+        # RECONSTRUCTION-floor cell — a negligible ~1e-6 m residual the DG(1)
+        # reconstruction leaves at a steep wet/dry edge — NOT a CFL violation
+        # a smaller dt would cure.  Re-take at the FULL dt and accept it: the
+        # residual is physically zero, and advancing at the halved dt would
+        # collapse the GLOBAL time step whenever such a cell PERSISTS (it
+        # floors every step), stalling the run.  Warn throttled.
+        s.Qnp1.assign(s._dt_halve_save)
+        s.Qaux_np1.assign(s._dt_halve_save_aux)
+        self.step(dt_value)
+        n = getattr(s, "_dt_halve_floor_count", 0) + 1
+        s._dt_halve_floor_count = n
+        if n == 1 or n % 200 == 0:
+            logger.warning(
+                f"dt-halving floor hit #{n} ({self.max_dt_halvings} halvings): "
+                f"accepting full dt={dt_value:.3e}, residual cell-mean h="
+                f"{self._min_cell_mean_h(s.Qnp1):.3e} (reconstruction floor)")
+        return dt_value
 
     def run_simulation(self):
         """Run the time loop until ``time_end``.
