@@ -1887,7 +1887,10 @@ class FiredrakeHyperbolicSolver:
             conn = V1.cell_node_map().values
             s._pp_cell_nodes = conn
         vals = Q.dat.data_ro[conn, h_idx]                 # (ncells, nnode)
-        return float(np.nanmin(vals.mean(axis=1)))
+        local = float(np.nanmin(vals.mean(axis=1))) if conn.size else float("inf")
+        # Global min over ranks so EVERY rank takes the same floor decision and
+        # the same number of dt-halvings (else MPI ranks diverge / deadlock).
+        return Q.function_space().mesh().comm.allreduce(local, op=MPI.MIN)
 
     def _step_with_positivity_dt_halving(self, dt_value):
         """Take one step; if it drives any cell MEAN of h negative, discard it
