@@ -84,6 +84,17 @@ class FiredrakeHyperbolicSolver:
     # ``limiter="ofdg"`` mode.  ``β=1`` matches the paper convention;
     # raise to dampen ripples more aggressively, drop to under-damp.
     ofdg_beta: float = field(default=1.0)
+    # Cell-mean positivity safety net (Xing & Zhang 2013, JSC 57:19-41,
+    # Algorithm §3.5): the Zhang-Shu θ-scaling only enforces NODAL h≥0 given
+    # a positive cell MEAN — it cannot rescue a negative mean.  When a step
+    # drives a cell mean negative (the steep wet/dry front: the Audusse/CFL
+    # convex decomposition broke), discard it and re-take the step with half
+    # the time step, repeating until every cell mean is ≥0 (or the halving
+    # floor is hit).  DG(1) only; default off (no behaviour change unless
+    # enabled).
+    dt_halving: bool = field(default=False)
+    max_dt_halvings: int = field(default=12)
+    cellmean_tol: float = field(default=1e-12)
     # Fields the slope limiter should **skip** (pass through
     # unmodified).  A list of state-field handles — each accepted by
     # :meth:`SystemModel.field_index`:
@@ -1851,6 +1862,56 @@ class FiredrakeHyperbolicSolver:
         self.update_Q(s.Qnp1, s.Qaux_np1, s.runtime_model)
         self.update_Qaux(s.Qnp1, s.Qaux_np1, s.runtime_model)
 
+    def _min_cell_mean_h(self, Q):
+        """Minimum over cells of the cell-mean water height (DG(1): the
+        arithmetic mean of the cell's nodal values on a simplex).  Reuses the
+        cached h-component index + cell→node map from the positivity scaling.
+        Returns ``+inf`` if the height field cannot be resolved (no-op)."""
+        s = self._state
+        h_idx = getattr(s, "_pp_h_index", None)
+        if h_idx is None:
+            names = [str(v) for v in s.system_model.variables.get_list()]
+            matches = [i for i, nm in enumerate(names)
+                       if nm in self.positivity_limiter_fields]
+            h_idx = matches[0] if matches else -1
+            s._pp_h_index = h_idx
+        if h_idx < 0:
+            return float("inf")
+        conn = getattr(s, "_pp_cell_nodes", None)
+        if conn is None:
+            V1 = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
+            conn = V1.cell_node_map().values
+            s._pp_cell_nodes = conn
+        vals = Q.dat.data_ro[conn, h_idx]                 # (ncells, nnode)
+        return float(np.nanmin(vals.mean(axis=1)))
+
+    def _step_with_positivity_dt_halving(self, dt_value):
+        """Take one step; if it drives any cell MEAN of h negative, discard it
+        and re-take from time n with half the step, repeating up to
+        ``max_dt_halvings`` (Xing & Zhang 2013 Algorithm §3.5).  Returns the dt
+        actually advanced.  ``step()`` copies ``Qnp1 → Qn`` at entry, so the
+        pre-step state lives in ``Qnp1`` here; we snapshot it and restore it
+        before each retry."""
+        s = self._state
+        if getattr(s, "_dt_halve_save", None) is None:
+            s._dt_halve_save = fd.Function(s.Qnp1.function_space())
+            s._dt_halve_save_aux = fd.Function(s.Qaux_np1.function_space())
+        s._dt_halve_save.assign(s.Qnp1)          # state at time n
+        s._dt_halve_save_aux.assign(s.Qaux_np1)
+        dt_try = dt_value
+        for attempt in range(self.max_dt_halvings + 1):
+            self.step(dt_try)
+            if self._min_cell_mean_h(s.Qnp1) >= -self.cellmean_tol:
+                return dt_try                    # cell means all ≥ 0 → accept
+            if attempt < self.max_dt_halvings:
+                s.Qnp1.assign(s._dt_halve_save)  # roll back to time n
+                s.Qaux_np1.assign(s._dt_halve_save_aux)
+                dt_try *= 0.5
+        logger.warning(
+            f"dt-halving floor hit ({self.max_dt_halvings} halvings): cell-mean "
+            f"h still {self._min_cell_mean_h(s.Qnp1):.3e} at dt={dt_try:.3e}")
+        return dt_try
+
     def run_simulation(self):
         """Run the time loop until ``time_end``.
 
@@ -1874,8 +1935,12 @@ class FiredrakeHyperbolicSolver:
             # Compute stable dt
             dt_value = s.compute_dt(s.Qnp1, s.Qaux_np1)
 
-            # Advance one step
-            self.step(dt_value)
+            # Advance one step — with the cell-mean positivity dt-halving
+            # safety net when enabled (returns the dt actually taken).
+            if self.dt_halving and self.dg_degree == 1:
+                dt_value = self._step_with_positivity_dt_halving(dt_value)
+            else:
+                self.step(dt_value)
 
             s.sim_time += dt_value
             iteration += 1
