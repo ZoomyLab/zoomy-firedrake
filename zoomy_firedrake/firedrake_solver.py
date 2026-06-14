@@ -1558,6 +1558,19 @@ class FiredrakeHyperbolicSolver:
         )
         return solver
 
+    def _build_source_solver(self, weak_form, Qnp1, Qaux_np1):
+        """Construct the solver for the implicit *source* substep.
+
+        Seam for the IMEX source treatment.  The base solver runs a full
+        Newton solve of the nonlinear source residual ``F(Qnp1) = 0``.  A
+        subclass can override this (together with :meth:`_get_weak_form_source`)
+        to swap in a different source integrator — e.g. a linearly-implicit
+        (Rosenbrock-1) step that solves a single *linear* system built from the
+        model's symbolic source Jacobian — without touching ``step()`` or
+        ``run_simulation()`` (both call ``solver_source.solve()`` polymorphically).
+        """
+        return self._get_nonlinear_solver(weak_form, Qnp1, Qaux_np1)
+
     def _build_problem(self, weak_form, Qnp1, with_jacobian: bool):
         if with_jacobian:
             J = fd.derivative(weak_form, Qnp1)
@@ -1790,7 +1803,7 @@ class FiredrakeHyperbolicSolver:
 
         # -- Phase 6: Build solvers --
         solver_convective = self._get_linear_solver(wf_convective, Qs, Qaux_s)
-        solver_source = self._get_nonlinear_solver(wf_source, Qnp1, Qaux_np1)
+        solver_source = self._build_source_solver(wf_source, Qnp1, Qaux_np1)
 
         # -- Phase 7: Build dt calculator --
         compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
