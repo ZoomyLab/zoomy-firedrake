@@ -94,6 +94,18 @@ class FiredrakeHyperbolicSolver:
     # enabled).
     dt_halving: bool = field(default=False)
     max_dt_halvings: int = field(default=12)
+    # Cell-mean positivity via a-posteriori MOOD (Clain-Diot-Loubere 2011;
+    # Dumbser-Zanotti-Loubere-Diot 2014) instead of dt-halving.  Take the full
+    # DG(1) step at the global dt; any cell whose mean h < -cellmean_tol is
+    # "troubled" and its FACE fluxes are blended to the robust first-order
+    # (cell-mean Audusse-Rusanov) flux — its DG(1) volume terms are dropped —
+    # so it evolves exactly like the positivity-preserving DG(0) scheme.
+    # Re-run at the SAME dt; cascade until clean (theta=1 == DG(0) == provably
+    # PP, so it terminates).  Conservation holds: each face carries one blended
+    # flux shared by both sides.  ``""`` (default) keeps the legacy dispatch
+    # (dt_halving flag); ``"mood"`` selects MOOD.  DG(1) only.
+    positivity_method: str = field(default="")
+    mood_max_passes: int = field(default=4)
     # Accept a cell mean as non-negative within this absolute tolerance: a
     # tiny residual (~1e-10 m, i.e. ~1e-12 relative to a metres-deep flow) is
     # roundoff at the wet/dry edge, not a real positivity failure — chasing it
@@ -589,24 +601,36 @@ class FiredrakeHyperbolicSolver:
         Q = Qn
         Qaux = Qaux_n
 
-        weak_form = fd.dot(test_q, (trial_q - Qn) / dt) * fd.dx
+        # --- a-posteriori MOOD blend (PAD positivity) ---------------------
+        # When ``positivity_method == "mood"`` the spatial operator is a convex
+        # blend of the high-order DG(1) operator and the robust first-order
+        # (cell-mean Audusse-Rusanov) operator, weighted per-face / per-cell by
+        # a DG(0) "troubled" marker ``theta`` in {0,1}.  ``theta == 0``
+        # everywhere ⇒ the form is identical to the high-order one (so a lake
+        # at rest, which has no troubled cells, is untouched and stays
+        # well-balanced).  The low-order operator uses cell-mean traces ``Q0``
+        # (a DG(0) projection of ``Qn``), so a fully-troubled cell evolves
+        # exactly like the DG(0) scheme, which is provably positivity-
+        # preserving.  Blending at the FACE (one shared flux per face) keeps
+        # the scheme conservative.
+        mood = self.positivity_method == "mood"
+        if mood:
+            s = self._state
+            Q0, Qaux0, theta = s._mood_Q0, s._mood_Qaux0, s._mood_theta
+            theta_f = ufl.max_value(theta("+"), theta("-"))   # per-interior-face
 
-        weak_form += (
-            fd.dot(
-                test_q("+") - test_q("-"),
-                self.numerical_flux(
-                    runtime_model,
-                    Q("+"),
-                    Q("-"),
-                    Qaux_n("+"),
-                    Qaux_n("-"),
-                    runtime_model.parameters,
-                    n("+"),
-                    mesh,
-                ),
-            )
-            * fd.dS
-        )
+        def _flux_face(QL, QR, QauxL, QauxR):
+            return self.numerical_flux(runtime_model, QL, QR, QauxL, QauxR,
+                                       runtime_model.parameters, n("+"), mesh)
+
+        F_hi = _flux_face(Q("+"), Q("-"), Qaux_n("+"), Qaux_n("-"))
+        if mood:
+            F_lo = _flux_face(Q0("+"), Q0("-"), Qaux0("+"), Qaux0("-"))
+            F_face = (1.0 - theta_f) * F_hi + theta_f * F_lo
+        else:
+            F_face = F_hi
+        weak_form = fd.dot(test_q, (trial_q - Qn) / dt) * fd.dx
+        weak_form += fd.dot(test_q("+") - test_q("-"), F_face) * fd.dS
 
         nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux_n("-"), Qaux_n("+"), n("-"))
@@ -621,6 +645,10 @@ class FiredrakeHyperbolicSolver:
         # way too (``solver_numpy.py:526–527``).  Halving them a
         # second time here would land NCP contributions at ¼ of the
         # paper strength.
+        if mood:
+            Dp0, Dm0 = nc_flux(Q0("-"), Q0("+"), Qaux0("-"), Qaux0("+"), n("-"))
+            Dp = (1.0 - theta_f) * Dp + theta_f * Dp0
+            Dm = (1.0 - theta_f) * Dm + theta_f * Dm0
         weak_form += fd.dot(test_q("+"), Dp) * fd.dS
         weak_form += fd.dot(test_q("-"), Dm) * fd.dS
 
@@ -645,19 +673,21 @@ class FiredrakeHyperbolicSolver:
                 runtime_model.parameters,
                 n,
             )
-            weak_form += ufl.dot(
-                test_q,
-                self.numerical_flux(runtime_model, Q, Q_bnd, Qaux_n, Qaux_n,
-                                    runtime_model.parameters, n, mesh)
-            ) * ds_measure
-
-            Dp, Dm = nc_flux(Q, Q_bnd, Qaux_n, Qaux_n, n)
-            weak_form += (
-                fd.dot(
-                    test_q,
-                    Dm
-                )
-            ) * ds_measure
+            F_bnd = self.numerical_flux(runtime_model, Q, Q_bnd, Qaux_n, Qaux_n,
+                                        runtime_model.parameters, n, mesh)
+            Dp_b, Dm_b = nc_flux(Q, Q_bnd, Qaux_n, Qaux_n, n)
+            if mood:
+                # blend the exterior facet by the boundary cell's marker
+                Q0_bnd = runtime_model.boundary_conditions(
+                    idx, sim_time, x_3d, dX, Q0, Qaux0,
+                    runtime_model.parameters, n)
+                F_bnd = (1.0 - theta) * F_bnd + theta * self.numerical_flux(
+                    runtime_model, Q0, Q0_bnd, Qaux0, Qaux0,
+                    runtime_model.parameters, n, mesh)
+                Dp0_b, Dm0_b = nc_flux(Q0, Q0_bnd, Qaux0, Qaux0, n)
+                Dm_b = (1.0 - theta) * Dm_b + theta * Dm0_b
+            weak_form += ufl.dot(test_q, F_bnd) * ds_measure
+            weak_form += fd.dot(test_q, Dm_b) * ds_measure
 
         # --- DG(1+) volume terms.  For dg_degree ≥ 1 the in-cell test
         # gradient is nonzero and the standard DG form needs, per cell,
@@ -676,15 +706,18 @@ class FiredrakeHyperbolicSolver:
             grad_Q = fd.grad(Q)             # (n_state, gdim)
             F_slabs = self._build_flux_pressure_slabs(
                 sm_vol, Q, Qaux, runtime_model)
+            # In a troubled cell (theta=1) the in-cell DG(1) volume terms are
+            # switched off so the cell collapses to the cell-mean DG(0) update.
+            vol_w = (1.0 - theta) if mood else 1.0
             for d in range(gdim):
-                weak_form -= fd.dot(F_slabs[d], grad_v[:, d]) * fd.dx
+                weak_form -= vol_w * fd.dot(F_slabs[d], grad_v[:, d]) * fd.dx
             ncp_nonzero = any(
                 e != 0 for e in sp.flatten(sm_vol.nonconservative_matrix))
             if ncp_nonzero:
                 B_slabs = self._build_ncp_slabs(
                     sm_vol, Q, Qaux, runtime_model)
                 for d in range(gdim):
-                    weak_form += fd.dot(
+                    weak_form += vol_w * fd.dot(
                         test_q, B_slabs[d] * grad_Q[:, d]) * fd.dx
 
         # --- Explicit IMEX slot: ``diffusion_matrix_explicit`` →
@@ -1786,6 +1819,18 @@ class FiredrakeHyperbolicSolver:
                 model, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
         )
 
+        # -- MOOD: cell-mean (DG0) shadow of Qn + per-cell troubled marker --
+        # Created BEFORE the convective form so the blend can reference them;
+        # the form holds these Function objects and ``step()`` / the MOOD
+        # cascade update their ``.dat`` in place.
+        if self.positivity_method == "mood":
+            V0 = fd.VectorFunctionSpace(mesh, "DG", 0, dim=V.value_size)
+            Vaux0 = fd.VectorFunctionSpace(mesh, "DG", 0, dim=Vaux.value_size)
+            Vth = fd.FunctionSpace(mesh, "DG", 0)
+            self._state._mood_Q0 = fd.Function(V0)
+            self._state._mood_Qaux0 = fd.Function(Vaux0)
+            self._state._mood_theta = fd.Function(Vth)
+
         # -- Phase 5: Build weak forms --
         x, x_3d, n = self._get_x_and_n(mesh)
         dt = fd.Constant(0.1)
@@ -1835,6 +1880,9 @@ class FiredrakeHyperbolicSolver:
             compute_dt=compute_dt,
             solver_convective=solver_convective,
             solver_source=solver_source,
+            _mood_Q0=getattr(self._state, "_mood_Q0", None),
+            _mood_Qaux0=getattr(self._state, "_mood_Qaux0", None),
+            _mood_theta=getattr(self._state, "_mood_theta", None),
         )
         object.__setattr__(self, "_state", state)
 
@@ -1854,6 +1902,13 @@ class FiredrakeHyperbolicSolver:
 
         # Update the UFL Constant with the new dt
         s.dt.assign(dt_value)
+
+        # MOOD: refresh the cell-mean (DG0) shadow of Qn that the blended
+        # convective flux falls back to in troubled cells.  (theta is set by
+        # ``_step_with_mood``; it stays fixed across one step's cascade.)
+        if getattr(s, "_mood_theta", None) is not None:
+            s._mood_Q0.project(s.Qn)
+            s._mood_Qaux0.project(s.Qaux_n)
 
         # --- Convective step (linear solve) ---
         s.solver_convective.solve()
@@ -1946,6 +2001,71 @@ class FiredrakeHyperbolicSolver:
                 f"{self._min_cell_mean_h(s.Qnp1):.3e} (reconstruction floor)")
         return dt_value
 
+    # ------------------------------------------------------------------
+    # a-posteriori MOOD positivity (PAD) — no dt reduction
+    # ------------------------------------------------------------------
+    def _mood_troubled_cells(self, Q):
+        """Boolean per-cell mask: cell-mean h non-finite or < -cellmean_tol.
+        Reuses the cached h-component index + DG(1) cell→node map.  Returns
+        ``None`` if the h field cannot be resolved (no-op)."""
+        s = self._state
+        h_idx = getattr(s, "_pp_h_index", None)
+        if h_idx is None:
+            names = [str(v) for v in s.system_model.variables.get_list()]
+            matches = [i for i, nm in enumerate(names)
+                       if nm in self.positivity_limiter_fields]
+            h_idx = matches[0] if matches else -1
+            s._pp_h_index = h_idx
+        if h_idx < 0:
+            return None
+        conn = getattr(s, "_pp_cell_nodes", None)
+        if conn is None:
+            V1 = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
+            conn = V1.cell_node_map().values
+            s._pp_cell_nodes = conn
+        if not conn.size:
+            return np.zeros(0, dtype=bool)
+        cmean = Q.dat.data_ro[conn, h_idx].mean(axis=1)   # (ncells,)
+        return ~np.isfinite(cmean) | (cmean < -self.cellmean_tol)
+
+    def _step_with_mood(self, dt_value):
+        """Take one DG(1) step at the GLOBAL dt; any cell whose mean h goes
+        negative is flagged ``troubled`` and re-evolved with the robust
+        first-order (cell-mean DG(0)) operator via the blended convective flux
+        — at the SAME dt.  Cascade until no cell is troubled (theta=1 == DG(0)
+        == provably positivity-preserving, so it terminates).  No dt reduction.
+        """
+        s = self._state
+        if getattr(s, "_dt_halve_save", None) is None:
+            s._dt_halve_save = fd.Function(s.Qnp1.function_space())
+            s._dt_halve_save_aux = fd.Function(s.Qaux_np1.function_space())
+        s._dt_halve_save.assign(s.Qnp1)          # state at time n
+        s._dt_halve_save_aux.assign(s.Qaux_np1)
+        s._mood_theta.assign(0.0)                # first pass: all high-order
+        self.step(dt_value)
+        comm = s.mesh.comm
+        for attempt in range(self.mood_max_passes):
+            troubled = self._mood_troubled_cells(s.Qnp1)
+            n_tr_local = 0 if troubled is None else int(troubled.sum())
+            if comm.allreduce(n_tr_local, op=MPI.SUM) == 0:
+                return                            # all cell means ≥ 0 → accept
+            # mark (accumulate) the troubled cells and re-run at the SAME dt
+            th = s._mood_theta.dat.data
+            th[troubled[:th.shape[0]]] = 1.0
+            s.Qnp1.assign(s._dt_halve_save)       # roll back to time n
+            s.Qaux_np1.assign(s._dt_halve_save_aux)
+            self.step(dt_value)
+        # Cascade exhausted (should be unreachable: full DG(0) is PP).  Warn.
+        n = getattr(s, "_mood_exhausted_count", 0) + 1
+        s._mood_exhausted_count = n
+        if n == 1 or n % 200 == 0:
+            tr = self._mood_troubled_cells(s.Qnp1)
+            n_tr = comm.allreduce(0 if tr is None else int(tr.sum()), op=MPI.SUM)
+            logger.warning(
+                f"MOOD cascade exhausted #{n} ({self.mood_max_passes} passes): "
+                f"{n_tr} cells still troubled, min cell-mean h="
+                f"{self._min_cell_mean_h(s.Qnp1):.3e}")
+
     def run_simulation(self):
         """Run the time loop until ``time_end``.
 
@@ -1971,7 +2091,9 @@ class FiredrakeHyperbolicSolver:
 
             # Advance one step — with the cell-mean positivity dt-halving
             # safety net when enabled (returns the dt actually taken).
-            if self.dt_halving and self.dg_degree == 1:
+            if self.positivity_method == "mood" and self.dg_degree == 1:
+                self._step_with_mood(dt_value)
+            elif self.dt_halving and self.dg_degree == 1:
                 dt_value = self._step_with_positivity_dt_halving(dt_value)
             else:
                 self.step(dt_value)
