@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Any, Callable
 
 import firedrake as fd
 from firedrake.functionspaceimpl import MixedFunctionSpace
@@ -62,6 +62,14 @@ class FiredrakeHyperbolicSolver:
     time_end: float = field(default=0.1)
     dg_degree: int = field(default=0)
     limiter: str = field(default="vertex")  # "vertex", "p_weighted", "ofdg", or "none"
+    # Optional IC OVERRIDE applied AFTER ``model.initial_conditions`` (which
+    # always runs first — zeroing every field when the model declares none).
+    # A callable ``f(Q, model)`` that writes into the DG Function ``Q``; it may
+    # overwrite ALL or only SOME fields (a partial IC on top of the model/zero
+    # default) — e.g. load ``[b, h, hu, hv]`` reservoir data from the mesh
+    # point-data.  ``None`` ⇒ the model IC alone.  The single-source-of-truth
+    # IC hook: no solver subclass needed.
+    initial_condition_overwrite: Optional[Callable] = field(default=None)
     # Zhang-Shu positivity-preserving θ-scaling of the water height
     # (Xing-Zhang-Shu 2010), applied AFTER the oscillation limiter.
     # Mean-preserving (no mass change, no truncation).  DG(1) only.
@@ -205,8 +213,12 @@ class FiredrakeHyperbolicSolver:
             values = system_model.parameter_values
             sub_map = {params[k]: float(getattr(values, k, 0.0))
                        for k in params.keys()}
+            # Use ``.is_zero`` (not ``== 0``): a parameter substituted to
+            # ``sp.Float(0.0)`` has ``.is_zero == True`` but ``== 0`` is
+            # structurally False (Float(0.0) != Integer(0)), so ``nu = 0``
+            # would slip through and build an empty ``0 * dS`` integral.
             return not all(
-                sp.simplify(sp.sympify(e).xreplace(sub_map)) == 0
+                bool(sp.simplify(sp.sympify(e).xreplace(sub_map)).is_zero)
                 for e in sp.flatten(T)
             )
         except Exception:
@@ -231,7 +243,16 @@ class FiredrakeHyperbolicSolver:
           are ``1`` (left endpoint) and ``2`` (right endpoint); the
           caller maps these to BC tag names.
         """
-        boundary_function_names = model.boundary_conditions._boundary_tags
+        # Accept either a BoundaryConditions container (``_boundary_tags``
+        # directly) or an object carrying one at ``.boundary_conditions``.
+        # After ``attach_boundary_conditions`` a SystemModel's
+        # ``.boundary_conditions`` is the lambdified KERNEL (no tags), so the
+        # container must be supplied explicitly (see setup_simulation).
+        boundary_function_names = (
+            getattr(model, "_boundary_tags", None)
+            or getattr(getattr(model, "boundary_conditions", None),
+                       "_boundary_tags", None)
+            or [])
         if msh_path is None:
             # In-memory mesh path: caller supplies the tag map.
             if boundary_tag_map is None:
@@ -267,7 +288,7 @@ class FiredrakeHyperbolicSolver:
             # momentum freely through ∂Ω.  The sentinel ``"__all__"``
             # is interpreted in the weak-form builder as ``fd.ds``
             # (no subdomain_id).
-            if model.boundary_conditions._boundary_tags:
+            if boundary_function_names:
                 return {"__all__": 0}
             return {}
 
@@ -413,24 +434,39 @@ class FiredrakeHyperbolicSolver:
         ]
         out.write(*subfuns, time=time)
 
-    def update_Qaux(self, Q, Qaux, runtime_model=None, eps=1e-8):
+    def _dt_arg(self, dt=None):
+        """Resolve the ``dt`` argument for the 4-arg model callbacks
+        ``update_(aux_)variables(Q, Qaux, p, dt)`` (REQ-61). Most models
+        (e.g. MalpassetSWE's KP ``hinv`` aux, the wet/dry momentum clamp)
+        ignore ``dt``; a Chorin corrector uses it. Prefer the live state
+        timestep; fall back to ``Constant(0.0)`` (e.g. during setup before
+        the first ``dt`` is computed)."""
+        if dt is not None:
+            return dt
+        st = getattr(self, "_state", None)
+        d = getattr(st, "dt", None) if st is not None else None
+        return d if d is not None else fd.Constant(0.0)
+
+    def update_Qaux(self, Q, Qaux, runtime_model=None, dt=None, eps=1e-8):
         """Update auxiliary variables via the model's callback.
 
         If the model exposes ``update_aux_variables``, that is used.
         Otherwise this is a no-op (generic models may have no aux variables).
         """
         if runtime_model is not None and hasattr(runtime_model, "update_aux_variables"):
-            Qaux_new = runtime_model.update_aux_variables(Q, Qaux, runtime_model.parameters)
+            Qaux_new = runtime_model.update_aux_variables(
+                Q, Qaux, runtime_model.parameters, self._dt_arg(dt))
             Qaux.interpolate(Qaux_new)
 
-    def update_Q(self, Q, Qaux, runtime_model=None):
+    def update_Q(self, Q, Qaux, runtime_model=None, dt=None):
         """Update conserved variables via the model's callback.
 
         If the model exposes ``update_variables``, that is used.
         Otherwise this is a no-op (generic models need no post-processing).
         """
         if runtime_model is not None and hasattr(runtime_model, "update_variables"):
-            Q_new = runtime_model.update_variables(Q, Qaux, runtime_model.parameters)
+            Q_new = runtime_model.update_variables(
+                Q, Qaux, runtime_model.parameters, self._dt_arg(dt))
             Q.interpolate(Q_new)
 
     # ==================================================================
@@ -558,11 +594,26 @@ class FiredrakeHyperbolicSolver:
         return compute_dt
 
     def set_initial_condition(self, Q, model):
-        mesh = Q.function_space().mesh()
-        x = fd.SpatialCoordinate(mesh)
-        coords = self.get_function_coordinates(Q)
-        Qarr = Q.dat.data
-        Q.dat.data[:] = model.initial_conditions.apply(coords.T, Qarr.T).T
+        """Two-phase initial condition for the DG Function ``Q`` — the base
+        behaviour for ALL solver variants:
+
+        1. **Model IC (always):** apply ``model.initial_conditions`` if the
+           model declares one, otherwise ZERO every field.  This guarantees a
+           well-defined starting state (and a clean zero default that a
+           partial override can build on).
+        2. **Override (optional):** if ``self.initial_condition_overwrite`` is
+           set, call ``f(Q, model)`` to overwrite — ALL or only SOME fields
+           (e.g. load ``[b, h, hu, hv]`` reservoir data from the mesh
+           point-data while leaving momentum at the zeroed default).
+        """
+        ic = getattr(model, "initial_conditions", None)
+        if ic is not None:
+            coords = self.get_function_coordinates(Q)
+            Q.dat.data[:] = ic.apply(coords.T, Q.dat.data.T).T
+        else:
+            Q.dat.data[:] = 0.0
+        if self.initial_condition_overwrite is not None:
+            self.initial_condition_overwrite(Q, model)
 
     def _get_functionspaces(self, mesh, runtime_model, degree=None):
         """Build DG function spaces with configurable polynomial degree.
@@ -796,7 +847,12 @@ class FiredrakeHyperbolicSolver:
 
         # Weak form: only source-active components contribute
         weak_form = fd.dot(test_q, diff_restricted / dt) * fd.dx
-        weak_form -= fd.dot(test_q, source_restricted) * fd.dx
+        # Pin the integration domain: a model with no (active) source makes
+        # source_restricted collapse to a domainless UFL Zero, and `Zero * fd.dx`
+        # raises "missing integration domain" (the same 0*h mesh-reference loss
+        # noted in _slot_is_nonzero). Pinning domain=mesh keeps the (zero) integral
+        # well-formed for sourceless models (e.g. flat-bed dam break). (REQ-95)
+        weak_form -= fd.dot(test_q, source_restricted) * fd.dx(domain=mesh)
 
         # Implicit IMEX slot: ``diffusion_matrix`` evaluated at Qnp1.
         # Newton drives both friction and diffusion to their implicit
@@ -1715,7 +1771,25 @@ class FiredrakeHyperbolicSolver:
     # setup_simulation / run_simulation / step
     # ==================================================================
 
-    def setup_simulation(self, mesh_file, model, *, boundary_tag_map=None):
+    @staticmethod
+    def _normalize_to_nsm(model):
+        """Accept a Model / SystemModel / NumericalSystemModel and return
+        ``(system_model, runtime_model)`` both driven by the SAME NSM (the
+        jax flow) — desingularized ``1/h`` and dry-cell-gated wavespeeds.
+        Single source of truth: no raw-Model numerics path."""
+        from zoomy_core.numerics import NumericalSystemModel as _NSM
+        if isinstance(model, _NSM):
+            nsm = model
+        elif hasattr(model, "system_model"):
+            nsm = _NSM.from_system_model(model.system_model)
+        elif isinstance(model, SystemModel):
+            nsm = _NSM.from_system_model(model)
+        else:
+            nsm = _NSM.from_system_model(SystemModel.from_model(model))
+        return nsm.sm, UFLRuntimeModel.from_nsm(nsm)
+
+    def setup_simulation(self, mesh_file, model, *, boundary_conditions=None,
+                         boundary_tag_map=None):
         """Set up all simulation state: mesh, model, spaces, forms, solvers.
 
         Stores state on ``self`` (via ``object.__setattr__`` since the class is
@@ -1741,21 +1815,16 @@ class FiredrakeHyperbolicSolver:
         else:
             mesh = mesh_file
             mesh_path = None
-        if isinstance(model, SystemModel):
-            raise NotImplementedError(
-                "FiredrakeHyperbolicSolver currently requires a Model "
-                "instance.  SystemModel-only ingestion would need a "
-                "SystemModel-driven UFL runtime that handles every "
-                "operator (boundary kernels included); the Model-based "
-                "path is the only one that does so today.  Pass the "
-                "Model — SystemModel.from_model is run internally."
-            )
-        system_model = SystemModel.from_model(model)
-        # The Model-based UFL runtime stays the source of truth for the
-        # per-operator UFL emissions (flux, source,
-        # nonconservative_matrix, boundary kernels) — its lambdify path
-        # already handles the Model.functions registry end-to-end.
-        runtime_model = UFLRuntimeModel(model)
+        system_model, runtime_model = self._normalize_to_nsm(model)
+        # Optional explicit BC container (the jax/NSM flow): attach it so the
+        # runtime gets the BC kernel, and keep it as the tag source for the
+        # boundary-tag mapping below (a SystemModel's ``.boundary_conditions``
+        # becomes the kernel after attach, losing ``_boundary_tags``).
+        if boundary_conditions is not None:
+            system_model.attach_boundary_conditions(boundary_conditions)
+            runtime_model = UFLRuntimeModel.from_system_model(system_model)
+        bc_tag_source = (boundary_conditions if boundary_conditions is not None
+                         else model)
 
         # Symbolic Riemann solver → UFL runtime.  Wire ``max_wavespeed``
         # to a UFL builder that pulls the eigenvalues from the
@@ -1814,9 +1883,12 @@ class FiredrakeHyperbolicSolver:
         self.update_Q(Qnp1, Qaux_np1, runtime_model)
 
         # -- Phase 4: Boundary tag mapping --
+        # BCs live on the (normalized) system_model — attached via
+        # ``attach_boundary_conditions`` — not necessarily on the passed
+        # object (which may be an NSM).
         map_boundary_tag_to_function_index = (
             self.get_map_boundary_tag_to_boundary_function_index(
-                model, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
+                bc_tag_source, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
         )
 
         # -- MOOD: cell-mean (DG0) shadow of Qn + per-cell troubled marker --
@@ -2126,7 +2198,8 @@ class FiredrakeHyperbolicSolver:
     # Backward-compatible entry point
     # ==================================================================
 
-    def solve(self, mshfile, model, *, boundary_tag_map=None):
+    def solve(self, mshfile, model, *, boundary_conditions=None,
+              boundary_tag_map=None):
         """Run a full simulation: setup + time loop.
 
         Equivalent to ``setup_simulation()`` followed by
@@ -2155,13 +2228,16 @@ class FiredrakeHyperbolicSolver:
         else:
             mesh = mshfile
             mesh_path = None
-        if isinstance(model, SystemModel):
-            raise NotImplementedError(
-                "FiredrakeHyperbolicSolver requires a Model instance; "
-                "SystemModel.from_model is called internally."
-            )
-        system_model = SystemModel.from_model(model)
-        runtime_model = UFLRuntimeModel(model)
+        system_model, runtime_model = self._normalize_to_nsm(model)
+        # Optional explicit BC container (the jax/NSM flow): attach it so the
+        # runtime gets the BC kernel, and keep it as the tag source for the
+        # boundary-tag mapping below (a SystemModel's ``.boundary_conditions``
+        # becomes the kernel after attach, losing ``_boundary_tags``).
+        if boundary_conditions is not None:
+            system_model.attach_boundary_conditions(boundary_conditions)
+            runtime_model = UFLRuntimeModel.from_system_model(system_model)
+        bc_tag_source = (boundary_conditions if boundary_conditions is not None
+                         else model)
 
         # Symbolic Riemann solver → UFL runtime (mirrors setup_simulation).
         def _max_wavespeed_ufl(*args, _rt=runtime_model, _sm=system_model):
@@ -2212,7 +2288,7 @@ class FiredrakeHyperbolicSolver:
         # Collect all boundary tags
         map_boundary_tag_to_function_index = (
             self.get_map_boundary_tag_to_boundary_function_index(
-                model, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
+                bc_tag_source, mesh_path, mesh, boundary_tag_map=boundary_tag_map)
         )
 
         return (mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1,
