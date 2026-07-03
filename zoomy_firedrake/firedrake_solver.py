@@ -92,16 +92,6 @@ class FiredrakeHyperbolicSolver:
     # ``limiter="ofdg"`` mode.  ``β=1`` matches the paper convention;
     # raise to dampen ripples more aggressively, drop to under-damp.
     ofdg_beta: float = field(default=1.0)
-    # Cell-mean positivity safety net (Xing & Zhang 2013, JSC 57:19-41,
-    # Algorithm §3.5): the Zhang-Shu θ-scaling only enforces NODAL h≥0 given
-    # a positive cell MEAN — it cannot rescue a negative mean.  When a step
-    # drives a cell mean negative (the steep wet/dry front: the Audusse/CFL
-    # convex decomposition broke), discard it and re-take the step with half
-    # the time step, repeating until every cell mean is ≥0 (or the halving
-    # floor is hit).  DG(1) only; default off (no behaviour change unless
-    # enabled).
-    dt_halving: bool = field(default=False)
-    max_dt_halvings: int = field(default=12)
     # Cell-mean positivity via a-posteriori MOOD (Clain-Diot-Loubere 2011;
     # Dumbser-Zanotti-Loubere-Diot 2014) instead of dt-halving.  Take the full
     # DG(1) step at the global dt; any cell whose mean h < -cellmean_tol is
@@ -2032,47 +2022,6 @@ class FiredrakeHyperbolicSolver:
         # the same number of dt-halvings (else MPI ranks diverge / deadlock).
         return Q.function_space().mesh().comm.allreduce(local, op=MPI.MIN)
 
-    def _step_with_positivity_dt_halving(self, dt_value):
-        """Take one step; if it drives any cell MEAN of h negative, discard it
-        and re-take from time n with half the step, repeating up to
-        ``max_dt_halvings`` (Xing & Zhang 2013 Algorithm §3.5).  Returns the dt
-        actually advanced.  ``step()`` copies ``Qnp1 → Qn`` at entry, so the
-        pre-step state lives in ``Qnp1`` here; we snapshot it and restore it
-        before each retry."""
-        s = self._state
-        if getattr(s, "_dt_halve_save", None) is None:
-            s._dt_halve_save = fd.Function(s.Qnp1.function_space())
-            s._dt_halve_save_aux = fd.Function(s.Qaux_np1.function_space())
-        s._dt_halve_save.assign(s.Qnp1)          # state at time n
-        s._dt_halve_save_aux.assign(s.Qaux_np1)
-        dt_try = dt_value
-        for attempt in range(self.max_dt_halvings + 1):
-            self.step(dt_try)
-            if self._min_cell_mean_h(s.Qnp1) >= -self.cellmean_tol:
-                return dt_try                    # cell means all ≥ 0 → accept
-            if attempt < self.max_dt_halvings:
-                s.Qnp1.assign(s._dt_halve_save)  # roll back to time n
-                s.Qaux_np1.assign(s._dt_halve_save_aux)
-                dt_try *= 0.5
-        # Floor hit: halving did NOT restore positivity, so this is a
-        # RECONSTRUCTION-floor cell — a negligible ~1e-6 m residual the DG(1)
-        # reconstruction leaves at a steep wet/dry edge — NOT a CFL violation
-        # a smaller dt would cure.  Re-take at the FULL dt and accept it: the
-        # residual is physically zero, and advancing at the halved dt would
-        # collapse the GLOBAL time step whenever such a cell PERSISTS (it
-        # floors every step), stalling the run.  Warn throttled.
-        s.Qnp1.assign(s._dt_halve_save)
-        s.Qaux_np1.assign(s._dt_halve_save_aux)
-        self.step(dt_value)
-        n = getattr(s, "_dt_halve_floor_count", 0) + 1
-        s._dt_halve_floor_count = n
-        if n == 1 or n % 200 == 0:
-            logger.warning(
-                f"dt-halving floor hit #{n} ({self.max_dt_halvings} halvings): "
-                f"accepting full dt={dt_value:.3e}, residual cell-mean h="
-                f"{self._min_cell_mean_h(s.Qnp1):.3e} (reconstruction floor)")
-        return dt_value
-
     # ------------------------------------------------------------------
     # a-posteriori MOOD positivity (PAD) — no dt reduction
     # ------------------------------------------------------------------
@@ -2161,12 +2110,10 @@ class FiredrakeHyperbolicSolver:
             # Compute stable dt
             dt_value = s.compute_dt(s.Qnp1, s.Qaux_np1)
 
-            # Advance one step — with the cell-mean positivity dt-halving
-            # safety net when enabled (returns the dt actually taken).
+            # Advance one step.  MOOD (a-posteriori positivity) is the DG(1)
+            # cascade path; otherwise a plain step.
             if self.positivity_method == "mood" and self.dg_degree == 1:
                 self._step_with_mood(dt_value)
-            elif self.dt_halving and self.dg_degree == 1:
-                dt_value = self._step_with_positivity_dt_halving(dt_value)
             else:
                 self.step(dt_value)
 
