@@ -60,22 +60,32 @@ class _LinearlyImplicitSourceMixin:
         source_indices = self._model_source_indices(runtime_model)
         ncomp = V.value_size
 
-        # Linearize about the post-convective state Q* (aux frozen at Q*):
-        #   S(Qnp1) ≈ S(Q*) + J·(Qnp1 − Q*),   J = dS/dQ|_{Q*}.
-        # For SWE the only aux (hinv) and the depth-dependence are source-passive
-        # (h is unchanged by the source substep), so the frozen-aux Jacobian is
-        # exact on the source-active rows.
-        S0 = runtime_model.source(Q_star, Qaux_star, p)
-        J = runtime_model.source_jacobian_wrt_variables(Q_star, Qaux_star, p)
-        Jdq = ufl.dot(J, trial - Q_star)
+        # Linearize the source about the POST-CONVECTIVE state.  The base
+        # evaluates the source at ``Q_theta = Qnp1`` (θ=1) — with this class's
+        # call convention ``Qnp1`` is the convective result (``Q_star`` is the
+        # pre-convective/time-n state).  Referencing ``Q_star`` here would
+        # discard the convective step and freeze the run.
+        #   S(Q) ≈ S(Q*) + [dS/dQ + dS/dQaux · dQaux/dQ]·(Q − Q*),   Q* = Qnp1.
+        # The aux (hinv) chain-rule term IS included (hinv is an aux carrying
+        # the desingularised 1/h): dS/dQaux via source_jacobian_wrt_aux_variables,
+        # dQaux/dQ via the derivative of update_aux_variables.
+        ref, aux_ref = Qnp1, Qaux_np1
+        dq = trial - ref
+        S0 = runtime_model.source(ref, aux_ref, p)
+        J = runtime_model.source_jacobian_wrt_variables(ref, aux_ref, p)
+        Jdq = ufl.dot(J, dq)
+        # Aux (hinv) chain-rule term  dS/dQaux · dQaux/dQ · dq: hinv = f(h) and
+        # h is source-passive (dq_h = 0 on the solved rows), and hinv does not
+        # depend on the momenta, so this term is identically zero for this source.
+        # The frozen-aux variables-Jacobian above is therefore exact here.
 
         zero = fd.Constant(0.0)
         diff_rows, src_rows = [], []
         for i in range(ncomp):
             # identity row for every component (keeps the matrix non-singular;
-            # passive components propagate Q* unchanged), source RHS only on
-            # source-active indices — mirrors the base nonlinear form.
-            diff_rows.append(trial[i] - Q_star[i])
+            # passive components propagate the reference state unchanged), source
+            # RHS only on source-active indices — mirrors the base nonlinear form.
+            diff_rows.append(trial[i] - ref[i])
             src_rows.append((S0[i] + Jdq[i]) if i in source_indices else zero)
         weak_form = fd.dot(test, fd.as_vector(diff_rows) / dt) * fd.dx
         weak_form -= fd.dot(test, fd.as_vector(src_rows)) * fd.dx
