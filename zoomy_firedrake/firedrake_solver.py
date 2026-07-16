@@ -13,6 +13,7 @@ from zoomy_core.fvm.riemann_solvers import Rusanov
 from zoomy_firedrake.firedrake_compat import (
     safe_extract_component, safe_assign_component,
 )
+from zoomy_firedrake.eigensolve import NumericalEigenSpectrum
 import numpy as np
 from mpi4py import MPI
 
@@ -393,6 +394,14 @@ class FiredrakeHyperbolicSolver:
         return rn.numerical_flux(Ql, Qr, Qauxl, Qauxr, parameters, n)
 
     def max_abs_eigenvalue(self, model, Q, Qaux, n, mesh):
+        # Numerical-spectrum path (``eigenvalues=None``: VAM / SME / SWE with
+        # the closed form dropped): the runtime carries no ``eigenvalues``
+        # operator, so read the compiled cell wave-speed field ``lam_cell``
+        # (``max_{n_s} max_i|λ_i(A_n)|`` via LAPACK ``dgeev``).  It is
+        # direction-agnostic, so the specific ``n`` is not needed here; the
+        # field is refreshed from the current state by ``compute_dt`` / ``step``.
+        if not hasattr(model, "eigenvalues"):
+            return self._state._eig_spectrum.lam_cell
         ev = model.eigenvalues(Q, Qaux, model.parameters, n)
         max_ev = abs(ev[0])
         for i in range(1, model.n_variables):
@@ -568,6 +577,11 @@ class FiredrakeHyperbolicSolver:
 
         def compute_dt(Q, Qaux):
             """Compute global stable dt for the given fields Q and Qaux."""
+            # Numerical-spectrum path: refresh the compiled ``lam_cell`` from
+            # the current state before it feeds the CFL bound (and the flux).
+            spec = getattr(self._state, "_eig_spectrum", None)
+            if spec is not None:
+                spec.refresh(Q, Qaux, model.parameters)
             lam = self.max_abs_eigenvalue(model, Q, Qaux, normals[0], mesh)
             for n_vec in normals[1:]:
                 lam = ufl.max_value(
@@ -1853,6 +1867,26 @@ class FiredrakeHyperbolicSolver:
 
         from zoomy_core.transformation.to_ufl import UFLRuntimeSymbolic
         UFLRuntimeSymbolic.module["max_wavespeed"] = _max_wavespeed_ufl
+
+        # Numerical-spectrum path.  When the model carries no closed-form
+        # ``eigenvalues`` (VAM has none; SME's Cardano form collapses ``dt``;
+        # the speed case drops SWE's on purpose), the runtime has no
+        # ``eigenvalues`` operator and the Riemann solver routes the wave speed
+        # through the opaque ``eigensystem`` / ``eigenvalues`` kernels — which
+        # are numerical, not UFL-expressible, so TSFC cannot inline them
+        # (``NameError: eigensystem`` at flux assembly).  Supply them from the
+        # compiled LAPACK ``dgeev`` cell wave-speed field ``lam_cell``: the
+        # numerical HLL/Rusanov collapses to local Lax-Friedrichs, whose only
+        # spectral input is ``max|λ|`` (see :mod:`zoomy_firedrake.eigensolve`).
+        eig_spectrum = None
+        if not hasattr(runtime_model, "eigenvalues"):
+            eig_spectrum = NumericalEigenSpectrum(
+                mesh, self.dg_degree, runtime_model)
+            UFLRuntimeSymbolic.module["eigensystem"] = \
+                eig_spectrum.eigensystem_hook
+            UFLRuntimeSymbolic.module["eigenvalues"] = \
+                eig_spectrum.eigenvalues_hook
+
         numerics = self.riemann_solver_cls(system_model)
         runtime_numerics = numerics.to_runtime_ufl()
 
@@ -1867,6 +1901,7 @@ class FiredrakeHyperbolicSolver:
                            Zstruct(system_model=system_model,
                                    runtime_numerics=runtime_numerics,
                                    runtime_model=runtime_model,
+                                   _eig_spectrum=eig_spectrum,
                                    limiter_exclude_indices=limiter_exclude_indices,
                                    source_passive_indices=source_passive_indices))
 
@@ -1940,6 +1975,7 @@ class FiredrakeHyperbolicSolver:
             runtime_model=runtime_model,
             system_model=system_model,
             runtime_numerics=runtime_numerics,
+            _eig_spectrum=getattr(self._state, "_eig_spectrum", None),
             limiter_exclude_indices=limiter_exclude_indices,
             source_passive_indices=source_passive_indices,
             model=model,
@@ -1986,6 +2022,12 @@ class FiredrakeHyperbolicSolver:
         if getattr(s, "_mood_theta", None) is not None:
             s._mood_Q0.project(s.Qn)
             s._mood_Qaux0.project(s.Qaux_n)
+
+        # Numerical-spectrum path: refresh the compiled ``lam_cell`` (the LLF
+        # face wave speed the convective flux reads) from the current ``Qn``.
+        spec = getattr(s, "_eig_spectrum", None)
+        if spec is not None:
+            spec.refresh(s.Qn, s.Qaux_n, s.runtime_model.parameters)
 
         # --- Convective step (linear solve) ---
         s.solver_convective.solve()
