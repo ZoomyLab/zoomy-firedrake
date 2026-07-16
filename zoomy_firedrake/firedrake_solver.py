@@ -2154,7 +2154,9 @@ class FiredrakeHyperbolicSolver:
         in-memory ``fd.MeshGeometry`` (passes through to
         :meth:`setup_simulation`).
         """
-        self.setup_simulation(mshfile, model, boundary_tag_map=boundary_tag_map)
+        self.setup_simulation(mshfile, model,
+                              boundary_conditions=boundary_conditions,
+                              boundary_tag_map=boundary_tag_map)
         self.run_simulation()
 
     # ------------------------------------------------------------------
