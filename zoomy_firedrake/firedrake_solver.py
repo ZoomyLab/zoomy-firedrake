@@ -1357,8 +1357,25 @@ class FiredrakeHyperbolicSolver:
         if rm is None or Qaux is None or sm is None \
                 or getattr(sm, "reconstruction_variables", None) is None:
             return Q, None
+        # REQ-176: the SYMBOLIC model declares `reconstruction_variables`, but
+        # the UFL printer (core-owned) does not yet LOWER it, so `rm` carries no
+        # runtime callable — an unguarded call AttributeErrors with a cryptic
+        # message on the first DG step of any bathymetry case (harmless only
+        # when b≡0 ⇒ η≡h).  Raise a clear, actionable error instead of the
+        # cryptic crash, and do NOT silently return the un-limited state (that
+        # would disable a limiter the user explicitly asked for — a silent
+        # wrong answer).  The fix is core's: lower `reconstruction_variables`
+        # in to_ufl (filed).
+        rv = getattr(rm, "reconstruction_variables", None)
+        if not callable(rv):
+            raise NotImplementedError(
+                "surface_limiting=True needs the model's "
+                "`reconstruction_variables` op lowered to UFL, but the "
+                "core UFL printer does not lower it yet (REQ-176 → core). "
+                "Run with surface_limiting=False until that lands, or use a "
+                "model whose reconstruction is identity.")
         W = fd.Function(Q.function_space())
-        W.interpolate(rm.reconstruction_variables(Q, Qaux, rm.parameters))
+        W.interpolate(rv(Q, Qaux, rm.parameters))
         return W, Qaux
 
     def _reconstruct_out(self, Q, W, Qaux):
