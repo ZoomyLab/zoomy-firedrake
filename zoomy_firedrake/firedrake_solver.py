@@ -1770,11 +1770,9 @@ class FiredrakeHyperbolicSolver:
         from zoomy_core.numerics import NumericalSystemModel as _NSM
         if isinstance(model, _NSM):
             nsm = model
-        elif hasattr(model, "system_model"):
-            nsm = _NSM.from_system_model(model.system_model)
         elif isinstance(model, SystemModel):
             nsm = _NSM.from_system_model(model)
-        else:
+        else:  # a declarative Model — the `.system_model` property was deleted
             nsm = _NSM.from_system_model(SystemModel.from_model(model))
         return nsm.sm, UFLRuntimeModel.from_nsm(nsm)
 
