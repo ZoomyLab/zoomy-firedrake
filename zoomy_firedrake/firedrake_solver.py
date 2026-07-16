@@ -10,8 +10,9 @@ from zoomy_core.misc.misc import Zstruct
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.fvm.riemann_solvers import Rusanov
-from zoomy_firedrake.firedrake_compat import (
-    safe_extract_component, safe_assign_component,
+from zoomy_firedrake.limiter_kernels import (
+    zhang_shu_positivity, extract_component, copy_component,
+    copy_component_v2v, cell_mean_finite_or_inf, mood_troubled_indicator,
 )
 from zoomy_firedrake.eigensolve import NumericalEigenSpectrum
 import numpy as np
@@ -592,8 +593,11 @@ class FiredrakeHyperbolicSolver:
                 / (dim_factor * degree_factor * lam + 1e-8)
             )
             dt_local.interpolate(dt_expr)
-            dt_min = float(np.min(dt_local.dat.data_ro))
-            return mesh.comm.allreduce(dt_min, op=MPI.MIN)
+            # Global stable dt = parallel min over every DG DOF (PETSc
+            # ``Vec.min`` does the allreduce internally, so every rank agrees;
+            # no numpy on ``.dat.data``, no manual MPI reduce).
+            with dt_local.dat.vec_ro as v:
+                return float(v.min()[1])
 
         return compute_dt
 
@@ -1288,8 +1292,6 @@ class FiredrakeHyperbolicSolver:
         Excluded components (e.g. bathymetry ``b``) pass through
         unchanged via :attr:`limiter_exclude_indices`.
         """
-        import numpy as np
-
         V = Q.function_space()
         mesh = V.mesh()
         ncomp = V.value_size
@@ -1302,47 +1304,48 @@ class FiredrakeHyperbolicSolver:
         DG0 = fd.FunctionSpace(mesh, "DG", 0)
         v0 = fd.TestFunction(DG0)
 
-        # Per-cell area (constant across the run).
-        area_co = fd.assemble(v0 * fd.dx)
-        area = np.array(area_co.dat.data_ro[:], copy=True)
-        area_safe = np.maximum(area, 1e-30)
-        length_scale = np.sqrt(area_safe)
+        # Per-cell length-scale √|K| — constant across the run, materialised
+        # once as a DG0 field.  ``assemble(1-form)`` returns a Cofunction (the
+        # dual); ``riesz_representation("l2")`` re-expresses its identical
+        # coefficients as a primal DG0 Function usable in UFL.
+        length_scale = self._mood_dg0("_ofdg_length", mesh)
+        if not getattr(s, "_ofdg_geom_ready", False):
+            area = fd.assemble(v0 * fd.dx).riesz_representation("l2")   # |K|
+            length_scale.interpolate(ufl.sqrt(ufl.max_value(area, 1e-30)))
+            s._ofdg_geom_ready = True
 
-        qi = fd.Function(DG_p)
-        qi_avg = fd.Function(DG0)
-        alpha = fd.Function(DG0)
+        ubar = self._mood_dg0("_ofdg_ubar", mesh)
+        alpha = self._mood_dg0("_ofdg_alpha", mesh)
         q_damped = fd.Function(DG_p)
 
+        # ``ū_i``, ``α_i`` and the jump indicator are now UFL on the DG space
+        # (DG0 L2-projection for the cell mean, ``fd.jump`` on ``fd.dS`` for the
+        # facet-jump sum, ``ufl.exp`` for the damping); only ``exp`` differs
+        # from the old numpy by a libm ULP.  ``ū + α (q − ū)`` is nodally
+        # interpolated into DG(k) exactly as before, then written into
+        # component ``i`` by a compiled par_loop (mass-preserving, halo-safe).
         for i in range(ncomp):
             if i in exclude:
                 continue
 
-            # Pull component i via dat-slice (avoids
-            # VectorFunctionSpace.sub(i) bugs documented in
-            # :meth:`_apply_slope_limiter`).
-            qi.dat.data[:] = Q.dat.data_ro[:, i]
+            # Cell average ū_i: the L2 projection onto DG0 is (∫_K q_i)/|K|,
+            # bit-identical to the old ``assemble(v0·q_i·dx)/|K|``.
+            ubar.project(Q[i])
 
-            # Cell average ū_i.
-            avg_co = fd.assemble(v0 * qi * fd.dx)
-            qi_avg.dat.data[:] = avg_co.dat.data_ro[:] / area_safe
+            # Per-cell edge-length-weighted sum of |[q_i]| over facets;
+            # normalise by √|K| and the 3 facets of the triangle.
+            jump = fd.assemble(
+                abs(fd.jump(Q[i])) * (v0('+') + v0('-')) * fd.dS
+            ).riesz_representation("l2")
+            jump_avg = jump / (length_scale * 3.0)
 
-            # Per-cell edge-length-weighted sum of |[q_i]| over facets.
-            jump_form = abs(fd.jump(qi)) * (v0('+') + v0('-')) * fd.dS
-            jump_co = fd.assemble(jump_form)
-            jump_sum = np.array(jump_co.dat.data_ro[:], copy=True)
+            # Dimensionless indicator and damping factor α_K = exp(−β I_K).
+            scale = ufl.max_value(abs(ubar), eps_scale)
+            alpha.interpolate(ufl.exp(-beta * jump_avg / scale))
 
-            # Normalise: per-facet magnitude average, length scale =
-            # √|K|, 3 facets per triangle.
-            jump_avg = jump_sum / (length_scale * 3.0)
-
-            # Dimensionless indicator and damping factor.
-            scale = np.maximum(np.abs(qi_avg.dat.data_ro[:]), eps_scale)
-            indicator = jump_avg / scale
-            alpha.dat.data[:] = np.exp(-beta * indicator)
-
-            # Broadcast (DG0 ū, DG0 α) into DG(k) via UFL interp.
-            q_damped.interpolate(qi_avg + alpha * (qi - qi_avg))
-            Q.dat.data[:, i] = q_damped.dat.data_ro[:]
+            # Broadcast (DG0 ū, DG0 α) into DG(k), write back component i.
+            q_damped.interpolate(ubar + alpha * (Q[i] - ubar))
+            copy_component(Q, q_damped, i)
 
     def _reconstruct_in(self, Q, Qaux):
         """Transform the conservative state into the MODEL's primitive
@@ -1498,57 +1501,31 @@ class FiredrakeHyperbolicSolver:
         exclude = getattr(self._state, "limiter_exclude_indices",
                           frozenset())
 
-        # Per-component limiting with **explicit dat.data slicing on
-        # both read and write**.  Excluded components (e.g. bathymetry
-        # ``b``) are never touched — bit-preserved.
+        # Per-component limiting via **compiled per-cell component copies**
+        # (:func:`zoomy_firedrake.limiter_kernels.extract_component` /
+        # ``copy_component`` — a ``pyop2.parloop`` over the cell-node map).
+        # Excluded components (e.g. bathymetry ``b``) are never touched —
+        # bit-preserved.  These kernels replace the earlier ``.dat.data``
+        # numpy slices: the slice write bypassed PyOP2's halo dirty-tracking
+        # (the root of the ``VectorFunctionSpace.sub(i)`` corruption + the
+        # ``Q.interpolate(fd.as_vector(...))`` ~1% mass injection those slices
+        # were introduced to dodge), whereas a par_loop declares its access
+        # (WRITE/RW/READ) so halos stay consistent — the root-cause fix, not a
+        # bypass.  The exact per-node component copy leaves Kuzmin's
+        # cell-average-preserving output bit-for-bit intact.
         #
-        # **Why direct dat slicing on the read side**: the obvious
-        # ``qi.interpolate(Q.sub(i))`` triggers a Firedrake stride bug
-        # in the interpolation kernel for ``VectorFunctionSpace.sub(i)``
-        # at ``i ≥ 2``: it silently zeroes scattered values in
-        # ``Q.sub(0)`` (b) on rank-boundary partitions.  Reproduced
-        # this session via the one-step diagnostic with a per-step
-        # b-probe inside the loop — b stayed clean through
-        # ``i = 0, 1``, then jumped to ~0 in select cells at the
-        # ``qi.interpolate(Q.sub(2))`` call.  Direct slicing avoids
-        # the kernel entirely.
-        #
-        # **Why direct dat slicing on the write side**: the old
-        # ``Q.interpolate(fd.as_vector(limited))`` re-vector path
-        # injected ~1% mass per step (the vector interpolation back
-        # into ``Q`` perturbs cell averages even though Kuzmin's
-        # kernel itself is cell-average-preserving — see the
-        # Firedrake VertexBasedLimiter source: ``q[ii] = qavg + alpha
-        # * (q[ii] - qavg)`` is conservative by construction).
-        #
-        # ``Q.dat.data[:, i] = qi.dat.data_ro[:]`` is an exact,
-        # bit-for-bit numpy slice copy mirroring how the IC writes
-        # ``Q`` (see ``MalpassetSolver.set_initial_condition``).  No
-        # projection, no interpolation, no layout ambiguity.
-        # Per-component limiting via the ``safe_*_component`` wrappers
-        # (see ``zoomy_firedrake.firedrake_compat`` for the bug
-        # documentation + the standalone reproducer).  When Firedrake
-        # fixes ``VectorFunctionSpace.sub(i).interpolate`` /
-        # ``.assign``, the wrappers collapse to plain
-        # ``.interpolate(Q.sub(i))`` and ``Q.sub(i).assign(qi)``.
-        #
-        # **Phase ordering matters**: all reads must complete before
-        # any writes.  Interleaving a write (direct ``dat.data``
-        # slice) and a subsequent read (``interpolate`` on a different
-        # subview) triggers a separate Firedrake bug where the read's
-        # halo handling fetches stale data and corrupts other
-        # columns.  Reproduced standalone — see the reproducer's
-        # final loop variant.
+        # **Phase ordering** (all reads before all writes) is kept: it is
+        # harmless with the compiled copies and documents the data flow.
         limited = {}
         for i in range(ncomp):
             if i in exclude:
                 continue
             qi = fd.Function(V_scalar)
-            safe_extract_component(qi, W, i)
+            extract_component(qi, W, i)
             limiter.apply(qi)
             limited[i] = qi
         for i, qi in limited.items():
-            safe_assign_component(W, qi, i)
+            copy_component(W, qi, i)
         self._reconstruct_out(Q, W, recon_aux)
         self._apply_positivity_scaling(Q)
 
@@ -1574,42 +1551,37 @@ class FiredrakeHyperbolicSolver:
         """
         if not self.positivity_limiter or self.dg_degree != 1:
             return
+        h_idx = self._resolve_h_index()
+        if h_idx < 0:
+            return
+        # Compiled per-cell θ-scaling (``zoomy_firedrake.limiter_kernels``):
+        # bit-faithful transcription of the removed numpy body — same cell
+        # mean, same θ = min(1, h̄/(h̄−h_min)), same ``mean + θ (h − mean)``
+        # rescale — run by a ``pyop2.parloop`` over ``mesh.cell_set``.  A cell
+        # that is already positive (θ≥1) is left bit-for-bit untouched.
+        zhang_shu_positivity(Q, h_idx)
+
+    def _resolve_h_index(self) -> int:
+        """State index of the positivity/MOOD water-height field (cached on
+        ``_state._pp_h_index``); ``-1`` if it cannot be resolved (no-op)."""
         s = self._state
-        # Resolve (and cache) the index of the water-height component.
         h_idx = getattr(s, "_pp_h_index", None)
         if h_idx is None:
             names = [str(v) for v in s.system_model.variables.get_list()]
             matches = [i for i, nm in enumerate(names)
                        if nm in self.positivity_limiter_fields]
-            if not matches:
-                s._pp_h_index = -1
-                return
-            h_idx = matches[0]
+            h_idx = matches[0] if matches else -1
             s._pp_h_index = h_idx
-        if h_idx < 0:
-            return
-        V_scalar = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
-        conn = getattr(s, "_pp_cell_nodes", None)
-        if conn is None:
-            conn = V_scalar.cell_node_map().values
-            s._pp_cell_nodes = conn
-        data = Q.dat.data
-        vals = data[conn, h_idx]                      # (ncells, 3)
-        mean = vals.mean(axis=1)
-        hmin = vals.min(axis=1)
-        denom = mean - hmin
-        with np.errstate(divide="ignore", invalid="ignore"):
-            theta = np.where(
-                hmin < 0.0,
-                np.where(mean > 0.0,
-                         np.minimum(1.0, mean / np.where(
-                             denom > 0.0, denom, 1.0)),
-                         0.0),
-                1.0)
-        if float(theta.min()) >= 1.0:
-            return
-        data[conn, h_idx] = mean[:, None] \
-            + theta[:, None] * (vals - mean[:, None])
+        return h_idx
+
+    def _mood_dg0(self, name, mesh):
+        """Lazily-allocated persistent DG0 scratch Function ``_state.<name>``."""
+        s = self._state
+        f = getattr(s, name, None)
+        if f is None:
+            f = fd.Function(fd.FunctionSpace(mesh, "DG", 0))
+            setattr(s, name, f)
+        return f
 
     # ==================================================================
     # Solver construction
@@ -2045,66 +2017,50 @@ class FiredrakeHyperbolicSolver:
         # stationary bathymetry ``b``) bit-for-bit.
         passive = getattr(s, "source_passive_indices", frozenset())
         if passive:
-            qnp1_data = s.Qnp1.dat.data
-            qs_data_ro = s.Qs.dat.data_ro
+            # Restore source-passive slots bit-for-bit via compiled per-cell
+            # component copies (halo-safe; no numpy on ``.dat.data``).
             for k in passive:
-                qnp1_data[:, k] = qs_data_ro[:, k]
+                copy_component_v2v(s.Qnp1, s.Qs, k)
         self._apply_slope_limiter(s.Qnp1, s.Qaux_np1)
         self.update_Q(s.Qnp1, s.Qaux_np1, s.runtime_model)
         self.update_Qaux(s.Qnp1, s.Qaux_np1, s.runtime_model)
 
     def _min_cell_mean_h(self, Q):
         """Minimum over cells of the cell-mean water height (DG(1): the
-        arithmetic mean of the cell's nodal values on a simplex).  Reuses the
-        cached h-component index + cell→node map from the positivity scaling.
-        Returns ``+inf`` if the height field cannot be resolved (no-op)."""
-        s = self._state
-        h_idx = getattr(s, "_pp_h_index", None)
-        if h_idx is None:
-            names = [str(v) for v in s.system_model.variables.get_list()]
-            matches = [i for i, nm in enumerate(names)
-                       if nm in self.positivity_limiter_fields]
-            h_idx = matches[0] if matches else -1
-            s._pp_h_index = h_idx
+        arithmetic mean of the cell's nodal values on a simplex).
+
+        The per-cell means are written into a DG0 field by a compiled
+        ``pyop2.parloop`` (:func:`limiter_kernels.cell_mean_finite_or_inf`,
+        ``+inf`` for a non-finite mean so the min reproduces ``numpy.nanmin``);
+        the min is the parallel ``PETSc Vec.min`` (the allreduce is internal, so
+        every rank takes the same floor decision).  Returns ``+inf`` when the
+        height field cannot be resolved (no-op)."""
+        h_idx = self._resolve_h_index()
         if h_idx < 0:
             return float("inf")
-        conn = getattr(s, "_pp_cell_nodes", None)
-        if conn is None:
-            V1 = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
-            conn = V1.cell_node_map().values
-            s._pp_cell_nodes = conn
-        vals = Q.dat.data_ro[conn, h_idx]                 # (ncells, nnode)
-        local = float(np.nanmin(vals.mean(axis=1))) if conn.size else float("inf")
-        # Global min over ranks so EVERY rank takes the same floor decision and
-        # the same number of dt-halvings (else MPI ranks diverge / deadlock).
-        return Q.function_space().mesh().comm.allreduce(local, op=MPI.MIN)
+        cmean = self._mood_dg0("_mood_cmean", Q.function_space().mesh())
+        cell_mean_finite_or_inf(Q, h_idx, cmean)
+        with cmean.dat.vec_ro as v:
+            return float(v.min()[1])
 
     # ------------------------------------------------------------------
     # a-posteriori MOOD positivity (PAD) — no dt reduction
     # ------------------------------------------------------------------
     def _mood_troubled_cells(self, Q):
-        """Boolean per-cell mask: cell-mean h non-finite or < -cellmean_tol.
-        Reuses the cached h-component index + DG(1) cell→node map.  Returns
-        ``None`` if the h field cannot be resolved (no-op)."""
-        s = self._state
-        h_idx = getattr(s, "_pp_h_index", None)
-        if h_idx is None:
-            names = [str(v) for v in s.system_model.variables.get_list()]
-            matches = [i for i, nm in enumerate(names)
-                       if nm in self.positivity_limiter_fields]
-            h_idx = matches[0] if matches else -1
-            s._pp_h_index = h_idx
+        """Write the per-cell troubled indicator (cell-mean h non-finite or
+        ``< -cellmean_tol``) into the DG0 field ``_state._mood_troubled`` via a
+        compiled ``pyop2.parloop`` (:func:`limiter_kernels.mood_troubled_indicator`)
+        and return the GLOBAL troubled-cell count (parallel ``PETSc Vec.sum`` of
+        the 0/1 indicator).  Returns ``(None, 0)`` when the h field cannot be
+        resolved (no-op)."""
+        h_idx = self._resolve_h_index()
         if h_idx < 0:
-            return None
-        conn = getattr(s, "_pp_cell_nodes", None)
-        if conn is None:
-            V1 = fd.FunctionSpace(Q.function_space().mesh(), "DG", 1)
-            conn = V1.cell_node_map().values
-            s._pp_cell_nodes = conn
-        if not conn.size:
-            return np.zeros(0, dtype=bool)
-        cmean = Q.dat.data_ro[conn, h_idx].mean(axis=1)   # (ncells,)
-        return ~np.isfinite(cmean) | (cmean < -self.cellmean_tol)
+            return None, 0
+        ind = self._mood_dg0("_mood_troubled", Q.function_space().mesh())
+        mood_troubled_indicator(Q, h_idx, self.cellmean_tol, ind)
+        with ind.dat.vec_ro as v:
+            n_tr = int(round(v.sum()))
+        return ind, n_tr
 
     def _step_with_mood(self, dt_value):
         """Take one DG(1) step at the GLOBAL dt; any cell whose mean h goes
@@ -2121,15 +2077,17 @@ class FiredrakeHyperbolicSolver:
         s._dt_halve_save_aux.assign(s.Qaux_np1)
         s._mood_theta.assign(0.0)                # first pass: all high-order
         self.step(dt_value)
-        comm = s.mesh.comm
         for attempt in range(self.mood_max_passes):
-            troubled = self._mood_troubled_cells(s.Qnp1)
-            n_tr_local = 0 if troubled is None else int(troubled.sum())
-            if comm.allreduce(n_tr_local, op=MPI.SUM) == 0:
+            ind, n_tr = self._mood_troubled_cells(s.Qnp1)
+            if n_tr == 0:
                 return                            # all cell means ≥ 0 → accept
-            # mark (accumulate) the troubled cells and re-run at the SAME dt
-            th = s._mood_theta.dat.data
-            th[troubled[:th.shape[0]]] = 1.0
+            # Mark (accumulate) the troubled cells — θ stays 1 once set — and
+            # re-run at the SAME dt.  The ``max(θ, indicator)`` on the two DG0
+            # fields is a compiled interpolate (via a temp to avoid in-place,
+            # per the eigensolve idiom); halos are handled by Firedrake.
+            tmp = self._mood_dg0("_mood_theta_tmp", s.mesh)
+            tmp.interpolate(ufl.max_value(s._mood_theta, ind))
+            s._mood_theta.assign(tmp)
             s.Qnp1.assign(s._dt_halve_save)       # roll back to time n
             s.Qaux_np1.assign(s._dt_halve_save_aux)
             self.step(dt_value)
@@ -2137,8 +2095,7 @@ class FiredrakeHyperbolicSolver:
         n = getattr(s, "_mood_exhausted_count", 0) + 1
         s._mood_exhausted_count = n
         if n == 1 or n % 200 == 0:
-            tr = self._mood_troubled_cells(s.Qnp1)
-            n_tr = comm.allreduce(0 if tr is None else int(tr.sum()), op=MPI.SUM)
+            _, n_tr = self._mood_troubled_cells(s.Qnp1)
             logger.warning(
                 f"MOOD cascade exhausted #{n} ({self.mood_max_passes} passes): "
                 f"{n_tr} cells still troubled, min cell-mean h="
