@@ -69,6 +69,10 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     amr_metric: str = field(default="complexity")
     amr_h_min: float = field(default=0.05)     # grad_h mode: finest element size
     amr_h_max: float = field(default=2.0)      # grad_h mode: coarsest element size
+    # Diagnostics: per-step cell count over the whole run (append-only; the
+    # frozen dataclass still permits mutating a list field).  Empty unless the
+    # AMR ``solve`` loop is used; lets a benchmark report mean/max cell count.
+    cell_history: list = field(factory=list)
 
     # ------------------------------------------------------------------
     # Metric helpers based on RiemannianMetric
@@ -157,57 +161,108 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
         metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
         return metric
 
-    def _metric_grad_h(self, Q, grad_ref=None, L_ref=None, L_bkg=None):
-        """Absolute, budget-free refinement metric from ``|grad h|``.
+    def _absolute_metric(self, mesh, frac, name):
+        """Build an ABSOLUTE isotropic size metric from a fine-fraction field.
 
-        The desired element size transitions continuously from ``L_bkg`` (coarse,
-        smooth flow) to ``L_ref`` (fine, steep h), with the fine fraction set by
-        ``|grad h| / grad_ref``.  The metric is NOT normalised to a target
-        complexity, so the cell count is emergent — mmg refines where detail is
-        needed and coarsens elsewhere — bounded only by the [L_ref, L_bkg] size
-        limits (``restrict_sizes``).  ``grad_ref`` defaults to the current global
-        max ``|grad h|`` (MPI-safe), so the transition tracks the running shock.
+        ``frac`` is a CG1 scalar in ``[0, 1]``: the target element size is
+        ``L = L_bkg - frac (L_bkg - L_ref)`` — ``L_ref`` (fine) where ``frac==1``,
+        ``L_bkg`` (coarse) where ``frac==0``.  The metric ``M = (1/L^2) I`` is
+        taken LITERALLY (NO complexity normalise), so the finest cell is exactly
+        ``amr_h_min`` for EVERY metric — the emergent cell count is bounded only
+        by ``[h_min, h_max]``.  This is the ``grad_h`` construction, factored out
+        so ``grad_h`` / ``hessian_h`` / ``wet_dry`` differ ONLY in the feature
+        indicator ``frac`` (a fair benchmark: same finest size, same coarsest).
         """
-        mesh = Q.function_space().mesh()
-        L_ref = self.amr_h_min if L_ref is None else L_ref
-        L_bkg = self.amr_h_max if L_bkg is None else L_bkg
-        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
-        # GRADIENT CAPTURE.  ``fd.interpolate(expr, V)`` returns a *symbolic*
-        # ``Interpolate`` (BaseFormOperator), not a Function; its UFL ``grad`` is
-        # identically zero (grad of the opaque operator, NOT of the interpolant),
-        # so the old ``grad(fd.interpolate(...))`` gave |grad h| == 1e-15 and every
-        # cell coarsened to ``h_max``.  Fix: materialise h as a real CG1 Function,
-        # then recover ``grad h`` by L2 projection (recovery.py) — a DG0 shock's
-        # cell jumps then produce a genuine, front-localised |grad h|.
-        h_cg = fd.Function(Vcg1).interpolate(Q.sub(1))
-        grad_h = recover_gradient_l2(
-            h_cg, target_space=fd.VectorFunctionSpace(mesh, "CG", 1))
-        gnorm = fd.Function(Vcg1)
-        gnorm.interpolate(fd.sqrt(fd.inner(grad_h, grad_h) + 1.0e-30))
-        if grad_ref is None:
-            with gnorm.dat.vec_ro as v:
-                grad_ref = max(v.max()[1], 1.0e-12)      # global max, collective
-        # continuous fine-fraction in [0, 1]; 1 where |grad h| >= grad_ref
-        frac = fd.Function(Vcg1)
-        frac.interpolate(ufl.min_value(1.0, gnorm / fd.Constant(grad_ref)))
-        L = fd.Function(Vcg1)
-        L.interpolate(L_bkg - frac * (L_bkg - L_ref))    # L_ref (fine) at steep h
-        weight = fd.Function(Vcg1)
-        weight.interpolate(1.0 / (L * L + 1.0e-12))      # metric eigenvalue = 1/L^2
-        # Build the metric DIRECTLY as M = (1/L^2) I (an ABSOLUTE size metric —
-        # edge length = 1/sqrt(eigenvalue) = L), NOT via compute_isotropic_metric,
-        # which yields an error indicator that must be normalise()'d to a budget.
-        # Here we skip normalise so the size is taken literally.
+        L_ref, L_bkg = self.amr_h_min, self.amr_h_max
+        Vcg1 = frac.function_space()
+        L = fd.Function(Vcg1).interpolate(L_bkg - frac * (L_bkg - L_ref))
+        weight = fd.Function(Vcg1).interpolate(1.0 / (L * L + 1.0e-12))
         dim = mesh.geometric_dimension
-        metric = RiemannianMetric(mesh, name="grad_h_metric")
-        metric.interpolate(weight * fd.Identity(dim))
+        metric = RiemannianMetric(mesh, name=name)
+        metric.interpolate(weight * fd.Identity(dim))    # M = (1/L^2) I
         metric.set_parameters({
             "dm_plex_metric_h_min": L_ref,
             "dm_plex_metric_h_max": L_bkg,
         })
         metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
         return metric
-    
+
+    @staticmethod
+    def _global_max(fn):
+        with fn.dat.vec_ro as v:
+            return max(v.max()[1], 1.0e-12)              # collective, MPI-safe
+
+    def _metric_grad_h(self, Q):
+        """Absolute metric refining the steep bore GRADIENT ``|grad h|``.
+
+        Materialise ``h`` as a real CG1 Function (``fd.interpolate(expr, V)``
+        returns a symbolic ``Interpolate`` whose UFL ``grad`` is identically zero
+        — the ~0 bug), then recover ``grad h`` by L2 projection; the fine-fraction
+        is ``min(1, |grad h| / max|grad h|)`` so the finest cells hug the bore.
+        """
+        mesh = Q.function_space().mesh()
+        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
+        h_cg = fd.Function(Vcg1).interpolate(Q.sub(1))
+        grad_h = recover_gradient_l2(
+            h_cg, target_space=fd.VectorFunctionSpace(mesh, "CG", 1))
+        gnorm = fd.Function(Vcg1).interpolate(
+            fd.sqrt(fd.inner(grad_h, grad_h) + 1.0e-30))
+        frac = fd.Function(Vcg1).interpolate(
+            ufl.min_value(1.0, gnorm / fd.Constant(self._global_max(gnorm))))
+        return self._absolute_metric(mesh, frac, "grad_h_metric")
+
+    def _metric_hessian_h(self, Q):
+        """Absolute metric refining the CURVATURE ``|grad(grad h)|`` of ``h``.
+
+        Recover the Hessian by TWO L2 projections of a MATERIALISED CG1 ``h``
+        (animate's ``recover_gradient_l2`` — NOT ``grad(fd.interpolate(...))``,
+        whose UFL grad of the opaque Interpolate operator is identically zero).
+        A DG0 bore interpolated to CG1 is piecewise-linear (kinked), so its
+        recovered second derivative spikes at the shock front AND the rarefaction
+        knees — a genuinely distinct feature detector from ``|grad h|``.  The
+        Frobenius norm ``|H|`` drives the same ABSOLUTE size construction, so the
+        finest cell matches the other two metrics (fair).  Budget-free (direct
+        build); no ``target_complexity`` normalise — see ``_absolute_metric``.
+        """
+        mesh = Q.function_space().mesh()
+        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
+        h_cg = fd.Function(Vcg1).interpolate(Q.sub(1))   # materialise (real Fn)
+        grad_h = recover_gradient_l2(
+            h_cg, target_space=fd.VectorFunctionSpace(mesh, "CG", 1))
+        hess = recover_gradient_l2(
+            grad_h, target_space=fd.TensorFunctionSpace(mesh, "CG", 1))
+        hnorm = fd.Function(Vcg1).interpolate(
+            fd.sqrt(fd.inner(hess, hess) + 1.0e-30))      # |grad^2 h|_F
+        frac = fd.Function(Vcg1).interpolate(
+            ufl.min_value(1.0, hnorm / fd.Constant(self._global_max(hnorm))))
+        return self._absolute_metric(mesh, frac, "hessian_h_metric")
+
+    def _metric_wet_dry_front(self, Q, h_dry=1.0e-4, sharpen=2.0):
+        """Absolute metric refining the moving WET/DRY interface (dry front).
+
+        Build a DG0 wet indicator (``h > h_dry``), L2-project it to CG1, and
+        recover ``|grad(wet)|`` — nonzero ONLY in the one-cell band straddling
+        the wet/dry line, so (unlike ``grad_h``, which fires over the whole steep
+        bore) this refines exclusively the dry-front line — a genuinely distinct
+        feature.  The L2 gradient recovery (not a DG0->CG1 point interpolation,
+        which returns 0/1 and kills any hat indicator) gives a smooth band mmg
+        realises at ``h_min``.  ``sharpen`` widens it so the moving front stays
+        inside the fine strip between refinements; same ABSOLUTE construction.
+        """
+        mesh = Q.function_space().mesh()
+        V0 = fd.FunctionSpace(mesh, "DG", 0)
+        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
+        wet = fd.Function(V0).interpolate(
+            fd.conditional(Q.sub(1) > h_dry, 1.0, 0.0))
+        wet_cg = fd.Function(Vcg1).interpolate(wet)
+        grad_w = recover_gradient_l2(
+            wet_cg, target_space=fd.VectorFunctionSpace(mesh, "CG", 1))
+        gnorm = fd.Function(Vcg1).interpolate(
+            fd.sqrt(fd.inner(grad_w, grad_w) + 1.0e-30))
+        frac = fd.Function(Vcg1).interpolate(
+            ufl.min_value(1.0, sharpen * gnorm / fd.Constant(self._global_max(gnorm))))
+        return self._absolute_metric(mesh, frac, "wet_dry_metric")
+
     def _metric_shock(self, Q,
                   gamma=20.0,            # refinement factor between weak/strong shocks
                   aniso=0.5,             # anisotropy ratio h_tang / h_norm (0<aniso≤1)
@@ -431,16 +486,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                                    "simulation.pvd"))
         self.write_state(s.Qnp1, s.Qaux_n, out, time=s.sim_time)
 
-        # Fixed target complexity taken from the initial (uniform) mesh — keeps
-        # the adapted cell budget roughly constant while redistributing it to
-        # the wet/dry front.
-        V1 = fd.FunctionSpace(s.mesh, "CG", 1)
-        metric0 = RiemannianMetric(s.mesh, name="initial_metric")
-        scaled = fd.Function(V1)
-        scaled.interpolate(1.0)
-        metric0.compute_isotropic_metric(scaled, interpolant="L2")
-        mesh_complexity = metric0.complexity()
-
         # ----- 3. Main time loop with AMR -----
         iteration = 0
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
@@ -452,18 +497,18 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                 logger.info(f"Refining at iteration {int(iteration)}")
                 old_num_cells = s.mesh.num_cells()
                 try:
+                    # Three absolute (budget-free) size metrics sharing the SAME
+                    # [h_min, h_max] — they differ ONLY in the feature indicator,
+                    # so the finest front cell is identical (fair benchmark).
                     if self.amr_metric == "grad_h":
-                        # Absolute, budget-free: size straight from |grad h|,
-                        # NO normalise / target complexity -> emergent cell count.
-                        metric = self._metric_grad_h(s.Qnp1)
+                        metric = self._metric_grad_h(s.Qnp1)          # bore gradient
+                    elif self.amr_metric == "hessian_h":
+                        metric = self._metric_hessian_h(s.Qnp1)       # curvature
+                    elif self.amr_metric in ("wet_dry", "complexity"):
+                        metric = self._metric_wet_dry_front(s.Qnp1)   # dry front
                     else:
-                        metric, _ = self._metric_wet_dry_smooth(
-                            s.Qnp1, gamma=10000, width=1)
-                        metric.set_parameters({
-                            "dm_plex_metric_target_complexity": mesh_complexity,
-                            "dm_plex_metric_p": np.inf,
-                        })
-                        metric.normalise()
+                        raise ValueError(
+                            f"unknown amr_metric {self.amr_metric!r}")
                     new_mesh = adapt(s.mesh, metric)
 
                     # Prolong the current solution into the new-mesh spaces
@@ -510,6 +555,7 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
 
             s.sim_time += dt_value
             iteration += 1
+            self.cell_history.append(int(s.mesh.num_cells()))
 
             if iteration % 10 == 0:
                 logger.info(
@@ -523,4 +569,6 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                 next_write_time += dt_snapshot
 
         execution_time = get_time() - start_time
+        s.last_iteration_count = int(iteration)
+        s.last_execution_time = float(execution_time)
         logger.info(f"Finished simulation in {execution_time:.3f} seconds")
