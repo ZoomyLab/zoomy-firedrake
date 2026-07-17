@@ -1994,6 +1994,90 @@ class FiredrakeHyperbolicSolver:
         )
         object.__setattr__(self, "_state", state)
 
+    def _rebuild_state_on_mesh(self, new_mesh, Qn_new, Qnp1_new,
+                               Qaux_n_new, Qaux_np1_new):
+        """Rebuild the mesh-dependent parts of ``self._state`` on ``new_mesh``.
+
+        Used by the AMR driver after a mesh adaptation.  The model / runtime /
+        symbolic-numerics / limiter-exclude sets are mesh-INDEPENDENT and are
+        carried over from the current ``self._state``; everything that
+        references the mesh — the function spaces, the stage/aux Functions, the
+        convective + source weak forms and their solvers, ``compute_dt``, the
+        numerical eigen-spectrum and the MOOD shadow fields — is rebuilt on
+        ``new_mesh`` by REUSING the same registration path as
+        :meth:`setup_simulation` (``_get_weak_form_*`` + ``_get_linear_solver``
+        / ``_build_source_solver``).  The prolonged solution
+        (``Qn_new`` / ``Qnp1_new`` / ``Qaux_*_new``) is adopted as-is — NO
+        initial-condition re-apply.  Because the convective problem is
+        ``constant_jacobian=True``, the fresh ``LinearVariationalProblem`` built
+        here is exactly the operator/kernel RE-ASSEMBLY on the new mesh: the
+        reused (factorized) operator is invalidated only at this point, so it
+        cannot go stale across an adapt.  After this call ``step()`` /
+        ``_step_with_mood()`` run unchanged off the rebuilt ``_state``.
+        """
+        s = self._state
+        runtime_model = s.runtime_model
+        V = Qn_new.function_space()
+        Vaux = Qaux_n_new.function_space()
+        Qs = fd.Function(V)
+        Qaux_s = fd.Function(Vaux)
+
+        # Numerical eigen-spectrum path (models with no closed-form
+        # eigenvalues): rebuild on the new mesh and re-register the UFL module
+        # hooks the flux assembly reads, so the new forms see the new-mesh
+        # field.  (Closed-form-eigenvalue models keep ``_eig_spectrum is None``
+        # and skip this.)
+        if getattr(s, "_eig_spectrum", None) is not None:
+            from zoomy_core.transformation.to_ufl import UFLRuntimeSymbolic
+            eig_spectrum = NumericalEigenSpectrum(
+                new_mesh, self.dg_degree, runtime_model)
+            UFLRuntimeSymbolic.module["eigensystem"] = \
+                eig_spectrum.eigensystem_hook
+            UFLRuntimeSymbolic.module["eigenvalues"] = \
+                eig_spectrum.eigenvalues_hook
+            s._eig_spectrum = eig_spectrum
+
+        # MOOD cell-mean (DG0) shadow + troubled marker on the new mesh, rebuilt
+        # BEFORE the convective form so the blend references the new Functions.
+        if getattr(s, "_mood_theta", None) is not None:
+            V0 = fd.VectorFunctionSpace(new_mesh, "DG", 0, dim=V.value_size)
+            Vaux0 = fd.VectorFunctionSpace(new_mesh, "DG", 0, dim=Vaux.value_size)
+            Vth = fd.FunctionSpace(new_mesh, "DG", 0)
+            s._mood_Q0 = fd.Function(V0)
+            s._mood_Qaux0 = fd.Function(Vaux0)
+            s._mood_theta = fd.Function(Vth)
+
+        # Drop lazily-allocated OLD-mesh scratch (MOOD DG0 fields + dt-halving
+        # rollback saves) so they re-allocate on the new mesh on next use.
+        for name in ("_mood_cmean", "_mood_troubled", "_mood_theta_tmp",
+                     "_dt_halve_save", "_dt_halve_save_aux"):
+            setattr(s, name, None)
+
+        # Adopt the new-mesh handles IN PLACE so the weak-form builders (which
+        # read ``self._state``) see the new mesh.
+        s.mesh = new_mesh
+        s.V, s.Vaux = V, Vaux
+        s.Qn, s.Qs, s.Qnp1 = Qn_new, Qs, Qnp1_new
+        s.Qaux_n, s.Qaux_s, s.Qaux_np1 = Qaux_n_new, Qaux_s, Qaux_np1_new
+
+        # Boundary-tag routing is a pure ``{physical_id: bc_index}`` map (or the
+        # ``__all__`` sentinel) whose values persist across adaptation → reuse.
+        mbt = s.map_boundary_tag_to_function_index
+        x, x_3d, n = self._get_x_and_n(new_mesh)
+        dt = s.dt          # same fd.Constant — ``step`` keeps assigning into it
+
+        wf_convective = self._get_weak_form_convective(
+            runtime_model, Qn_new, Qs, Qaux_n_new, Qaux_s,
+            n, new_mesh, mbt, s.sim_time, dt, x, x_3d)
+        wf_source = self._get_weak_form_source(
+            runtime_model, Qnp1_new, Qs, Qaux_np1_new, Qaux_s,
+            n, new_mesh, mbt, s.sim_time, dt, x, x_3d, theta=1.0)
+
+        s.solver_convective = self._get_linear_solver(wf_convective, Qs, Qaux_s)
+        s.solver_source = self._build_source_solver(
+            wf_source, Qnp1_new, Qaux_np1_new)
+        s.compute_dt = self.get_compute_dt(new_mesh, runtime_model, CFL=self.CFL)
+
     def step(self, dt_value):
         """Advance one time step using Lie splitting: convective -> source.
 

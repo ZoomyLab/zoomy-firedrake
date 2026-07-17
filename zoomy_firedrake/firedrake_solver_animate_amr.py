@@ -347,137 +347,114 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     # Main solve
     # ------------------------------------------------------------------
 
-    def solve(self, mshfile, model):
-        
+    def solve(self, mshfile, model, *, boundary_conditions=None,
+              boundary_tag_map=None):
+
         start_time = get_time()
-        # ----- 1. Setup -----
-        mesh, runtime_model, V, Vaux, Qn, Qs, Qnp1, Qaux_n, Qaux_s, Qaux_np1, map_boundary_tag_to_function_index = \
-            self._setup(mshfile, model)
-        x, x_3d, n = self._get_x_and_n(mesh)
 
-        compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
-        sim_time = 0.0
-        dt = fd.Constant(0.1)
+        # ----- 1. Build the initial state with the SAME machinery as the
+        # non-AMR solver.  After this ``self._state`` carries the function
+        # spaces, Qn/Qs/Qnp1/Qaux_*, ``solver_convective`` / ``solver_source``,
+        # ``compute_dt``, the MOOD shadow fields and the limiter-exclude sets —
+        # so the AMR run steps through the identical ``step()`` /
+        # ``_step_with_mood()`` (slope limiter + MOOD + implicit source), not a
+        # stripped copy. -----
+        self.setup_simulation(mshfile, model,
+                              boundary_conditions=boundary_conditions,
+                              boundary_tag_map=boundary_tag_map)
+        s = self._state
 
-
-        # ---- 2. Output setup ----
+        # ----- 2. Output setup -----
         main_dir = misc.get_main_directory()
         out = VTKFile(os.path.join(main_dir, self.settings.output.directory,
                                    "simulation.pvd"))
-        out_id = VTKFile(os.path.join(main_dir, self.settings.output.directory,
-                                      "indicator.pvd"))
-        out_metric = VTKFile(os.path.join(main_dir, self.settings.output.directory,
-                                          "metric.pvd"))
+        self.write_state(s.Qnp1, s.Qaux_n, out, time=s.sim_time)
 
-        # Write initial snapshot at t=0
-        self.write_state(Qnp1, Qaux_n, out, time=sim_time)
+        # Fixed target complexity taken from the initial (uniform) mesh — keeps
+        # the adapted cell budget roughly constant while redistributing it to
+        # the wet/dry front.
+        V1 = fd.FunctionSpace(s.mesh, "CG", 1)
+        metric0 = RiemannianMetric(s.mesh, name="initial_metric")
+        scaled = fd.Function(V1)
+        scaled.interpolate(1.0)
+        metric0.compute_isotropic_metric(scaled, interpolant="L2")
+        mesh_complexity = metric0.complexity()
 
-
-        # ---- 3. Main time loop with AMR ----
+        # ----- 3. Main time loop with AMR -----
         iteration = 0
         dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
         next_write_time = dt_snapshot
-        
-        V1 = fd.FunctionSpace(mesh, "CG", 1)
-        metric = RiemannianMetric(mesh, name="initial_metric")
-        scaled = fd.Function(V1)
-        scaled.interpolate(1.0)
-        metric.compute_isotropic_metric(scaled, interpolant="L2")
-        mesh_complexity = metric.complexity()
 
-
-        weak_forms = self._register_weak_forms(runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d)
-        solvers = self._register_solvers(weak_forms, Qnp1, Qaux_n)
-
-        while sim_time < self.time_end:
-                        # 3b. AMR every `refine_every` iterations (up to max_refinements)
-            if (iteration % self.refine_every == 0 and self.enable_amr):
-                logger.info(
-                    f"Refining at iteration {int(iteration)}"
-                )
-
-                old_num_cells = mesh.num_cells()
+        while s.sim_time < self.time_end:
+            # 3a. AMR every `refine_every` iterations.
+            if self.enable_amr and iteration % self.refine_every == 0:
+                logger.info(f"Refining at iteration {int(iteration)}")
+                old_num_cells = s.mesh.num_cells()
                 try:
-                    M_wave = self._metric_wave(Qnp1, gamma=1.0, aniso=0.5)  # Strong refinement in fast regions
-                    M_wd, _ = self._metric_wet_dry_smooth(Qnp1, gamma=10000, width=1)
-                    # M_shock = self._metric_shock(Qnp1, gamma=1.0, aniso=0.5)
-
-                    # Combine and normalize via Animate:
-                    combined_metric = M_wd
-                    # combined_metric = M_wd.combine(M_wave, average=True)  # intersection
-                    # combined_metric = M_wd.combine(M_shock, average=True)  # intersection
-
-                    combined_metric.set_parameters({
+                    metric, _ = self._metric_wet_dry_smooth(
+                        s.Qnp1, gamma=10000, width=1)
+                    metric.set_parameters({
                         "dm_plex_metric_target_complexity": mesh_complexity,
                         "dm_plex_metric_p": np.inf,
                     })
-                    combined_metric.normalise()
-                    refined_mesh = adapt(mesh, combined_metric)
-                    mesh = refined_mesh
+                    metric.normalise()
+                    new_mesh = adapt(s.mesh, metric)
 
-                    # Rebuild function spaces on new mesh
-                    nvar = runtime_model.n_variables
-                    naux = runtime_model.n_aux_variables
+                    # Prolong the current solution into the new-mesh spaces
+                    # (conservative + positivity-preserving on h).
+                    nvar = s.runtime_model.n_variables
+                    naux = s.runtime_model.n_aux_variables
+                    V = fd.VectorFunctionSpace(
+                        new_mesh, "DG", self.dg_degree, dim=nvar)
+                    Vaux = fd.VectorFunctionSpace(
+                        new_mesh, "DG", self.dg_degree, dim=naux)
+                    Qn_new = self._prolong_vector_function(s.Qn, V)
+                    Qnp1_new = self._prolong_vector_function(s.Qnp1, V)
+                    Qaux_n_new = fd.Function(Vaux, name="Qaux")
+                    Qaux_np1_new = fd.Function(Vaux, name="Qaux")
+                    self.update_Qaux(Qn_new, Qaux_n_new, s.runtime_model)
+                    self.update_Qaux(Qnp1_new, Qaux_np1_new, s.runtime_model)
+                    self.update_Q(Qn_new, Qaux_n_new, s.runtime_model)
+                    self.update_Q(Qnp1_new, Qaux_np1_new, s.runtime_model)
 
-                    V = fd.VectorFunctionSpace(mesh, "DG", 0, dim=nvar)
-                    Vaux = fd.VectorFunctionSpace(mesh, "DG", 0, dim=naux)
-
-                    # Prolong solutions
-                    Qn_new = self._prolong_vector_function(Qn, V)
-                    Qnp1_new = self._prolong_vector_function(Qnp1, V)
-
-                    Qaux_new_n = fd.Function(Vaux, name="Qaux")
-                    Qaux_new_np1 = fd.Function(Vaux, name="Qaux")
-
-                    
-                    self.update_Qaux(Qn_new, Qaux_new_n)
-                    self.update_Qaux(Qnp1_new, Qaux_new_np1)
-                    self.update_Q(Qn_new, Qaux_new_n)
-                    self.update_Q(Qnp1_new, Qaux_new_np1)
-
-                    Qn, Qnp1, Qaux_n , Qaux_np1= Qn_new, Qnp1_new, Qaux_new_n, Qaux_new_np1
-                    compute_dt = self.get_compute_dt(mesh, runtime_model, CFL=self.CFL)
-
-                    x, x_3d, n = self._get_x_and_n(mesh)
-                    weak_form = self._get_weak_form(
-                        runtime_model, Qn, Qnp1, Qaux_n, Qaux_np1, n, mesh,
-                        map_boundary_tag_to_function_index, sim_time, dt, x, x_3d
-                    )
-                    
-                    solvers = self._register_solvers(weak_forms, Qnp1, Qaux_n)
-
+                    # Rebuild the mesh-dependent state (spaces, weak forms,
+                    # solvers, compute_dt, MOOD/eig fields) on the NEW mesh via
+                    # the base registration path.  The convective operator is
+                    # re-assembled here (constant_jacobian LVP on the new M) so
+                    # it never goes stale across the adapt.
+                    self._rebuild_state_on_mesh(
+                        new_mesh, Qn_new, Qnp1_new, Qaux_n_new, Qaux_np1_new)
+                    s = self._state
                 except Exception as e:
                     print("Mesh refinement failed:", e)
                     traceback.print_exc()
                     raise
 
-                new_num_cells = mesh.num_cells()
-                logger.info(""f"Mesh refined: {old_num_cells} → {new_num_cells} cells")
-                
-            # 3b. Advance in time
-            Qn.assign(Qnp1)
-            self.update_Q(Qn, Qaux_n)
-            self.update_Qaux(Qn, Qaux_n)
-            self.update_Q(Qnp1, Qaux_np1)
-            self.update_Qaux(Qnp1, Qaux_np1)
+                logger.info(
+                    f"Mesh refined: {old_num_cells} → {s.mesh.num_cells()} cells")
 
-            dt.assign(compute_dt(Qn, Qaux_n))
-            for solver in solvers:
-                solver.solve()
+            # 3b. Advance one step using the SAME stepping code as the base
+            # ``run_simulation`` loop — limiter + MOOD + implicit source all
+            # live inside ``step`` / ``_step_with_mood``.
+            dt_value = s.compute_dt(s.Qnp1, s.Qaux_np1)
+            if self.positivity_method == "mood" and self.dg_degree == 1:
+                self._step_with_mood(dt_value)
+            else:
+                self.step(dt_value)
 
-            sim_time += float(dt)
+            s.sim_time += dt_value
             iteration += 1
 
             if iteration % 10 == 0:
                 logger.info(
-                    f"iteration: {int(iteration)}, time: {float(sim_time):.6f}, "
-                    f"dt: {float(dt):.6f}, next write at time: {float(next_write_time):.6f}"
-                )
+                    f"iteration: {int(iteration)}, time: {float(s.sim_time):.6f}, "
+                    f"dt: {float(dt_value):.6f}, "
+                    f"next write at time: {float(next_write_time):.6f}")
 
-
-            # 3c. Output only when reaching the next snapshot time
-            if sim_time + 1e-12 >= next_write_time:
-                self.write_state(Qnp1, Qaux_n, out, time=sim_time)
+            # 3c. Output only when reaching the next snapshot time.
+            if s.sim_time + 1e-12 >= next_write_time or s.sim_time >= self.time_end:
+                self.write_state(s.Qnp1, s.Qaux_np1, out, time=s.sim_time)
                 next_write_time += dt_snapshot
+
         execution_time = get_time() - start_time
         logger.info(f"Finished simulation in {execution_time:.3f} seconds")
