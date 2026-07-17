@@ -455,8 +455,21 @@ class FiredrakeHyperbolicSolver:
         Otherwise this is a no-op (generic models may have no aux variables).
         """
         if runtime_model is not None and hasattr(runtime_model, "update_aux_variables"):
+            # REQ-185: update_aux_variables(Q, Qaux, p, t, x) — t = live sim-time
+            # Constant, x = length-3 position vector (no dt).  Re-interpolated each
+            # step, so building x/t here (not threading through ~15 callers) is fine.
+            m = Q.function_space().mesh()
+            xc = fd.SpatialCoordinate(m)
+            gd = m.geometric_dimension
+            x3 = (fd.as_vector([xc[0], fd.Constant(0.0), fd.Constant(0.0)]) if gd == 1
+                  else fd.as_vector([xc[0], xc[1], fd.Constant(0.0)]) if gd == 2
+                  else fd.as_vector([xc[0], xc[1], xc[2]]))
+            st = getattr(self, "_state", None)
+            t = getattr(st, "sim_time_const", None) if st is not None else None
+            if t is None:
+                t = fd.Constant(0.0)
             Qaux_new = runtime_model.update_aux_variables(
-                Q, Qaux, runtime_model.parameters, self._dt_arg(dt))
+                Q, Qaux, runtime_model.parameters, t, x3)
             Qaux.interpolate(Qaux_new)
 
     def update_Q(self, Q, Qaux, runtime_model=None, dt=None):
@@ -848,8 +861,15 @@ class FiredrakeHyperbolicSolver:
         Q_theta = theta * Qnp1 + (1.0 - theta) * Q_star
         Qaux_theta = theta * Qaux_np1 + (1.0 - theta) * Qaux_star
 
-        # Full source vector from the model
-        source_full = runtime_model.source(Q_theta, Qaux_theta, runtime_model.parameters)
+        # Full source vector from the model (REQ-185: source(Q,Qaux,p,t,x), with
+        # dt inserted before x only when the runtime declares ``source_needs_dt``).
+        # ``sim_time`` here is the live Constant; ``x_3d`` the length-3 position.
+        if getattr(runtime_model, "source_needs_dt", False):
+            source_full = runtime_model.source(
+                Q_theta, Qaux_theta, runtime_model.parameters, sim_time, dt, x_3d)
+        else:
+            source_full = runtime_model.source(
+                Q_theta, Qaux_theta, runtime_model.parameters, sim_time, x_3d)
 
         zero = fd.Constant(0.0)
 
@@ -1952,15 +1972,20 @@ class FiredrakeHyperbolicSolver:
         # -- Phase 5: Build weak forms --
         x, x_3d, n = self._get_x_and_n(mesh)
         dt = fd.Constant(0.1)
-        sim_time = 0.0
+        sim_time = 0.0                      # float — loop arithmetic + output
+        # REQ-185: a LIVE time Constant the source/BC forms reference.  Forms are
+        # assembled once and reused, so ``time`` in the operators must be an
+        # updatable Constant (``step`` publishes ``s.sim_time`` into it), not a
+        # baked float — otherwise a time-dependent source freezes at t=0.
+        sim_time_const = fd.Constant(0.0)
 
         wf_convective = self._get_weak_form_convective(
             runtime_model, Qn, Qs, Qaux_n, Qaux_s,
-            n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d,
+            n, mesh, map_boundary_tag_to_function_index, sim_time_const, dt, x, x_3d,
         )
         wf_source = self._get_weak_form_source(
             runtime_model, Qnp1, Qs, Qaux_np1, Qaux_s,
-            n, mesh, map_boundary_tag_to_function_index, sim_time, dt, x, x_3d,
+            n, mesh, map_boundary_tag_to_function_index, sim_time_const, dt, x, x_3d,
             theta=1.0,
         )
 
@@ -1996,6 +2021,7 @@ class FiredrakeHyperbolicSolver:
             map_boundary_tag_to_function_index=map_boundary_tag_to_function_index,
             dt=dt,
             sim_time=sim_time,
+            sim_time_const=sim_time_const,
             compute_dt=compute_dt,
             solver_convective=solver_convective,
             solver_source=solver_source,
@@ -2079,10 +2105,10 @@ class FiredrakeHyperbolicSolver:
 
         wf_convective = self._get_weak_form_convective(
             runtime_model, Qn_new, Qs, Qaux_n_new, Qaux_s,
-            n, new_mesh, mbt, s.sim_time, dt, x, x_3d)
+            n, new_mesh, mbt, s.sim_time_const, dt, x, x_3d)
         wf_source = self._get_weak_form_source(
             runtime_model, Qnp1_new, Qs, Qaux_np1_new, Qaux_s,
-            n, new_mesh, mbt, s.sim_time, dt, x, x_3d, theta=1.0)
+            n, new_mesh, mbt, s.sim_time_const, dt, x, x_3d, theta=1.0)
 
         s.solver_convective = self._get_linear_solver(wf_convective, Qs, Qaux_s)
         s.solver_source = self._build_source_solver(
@@ -2105,6 +2131,12 @@ class FiredrakeHyperbolicSolver:
 
         # Update the UFL Constant with the new dt
         s.dt.assign(dt_value)
+
+        # REQ-185: publish the current sim time into the live Constant that the
+        # (once-assembled, reused) source/BC forms reference.  Covers the base
+        # loop, the AMR loop, and the MOOD cascade — all route through ``step``.
+        if getattr(s, "sim_time_const", None) is not None:
+            s.sim_time_const.assign(s.sim_time)
 
         # MOOD: refresh the cell-mean (DG0) shadow of Qn that the blended
         # convective flux falls back to in troubled cells.  (theta is set by

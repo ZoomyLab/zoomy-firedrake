@@ -71,7 +71,11 @@ class _LinearlyImplicitSourceMixin:
         # dQaux/dQ via the derivative of update_aux_variables.
         ref, aux_ref = Qnp1, Qaux_np1
         dq = trial - ref
-        S0 = runtime_model.source(ref, aux_ref, p)
+        # REQ-185: source(Q,Qaux,p,t,x) (+dt before x when source_needs_dt).
+        if getattr(runtime_model, "source_needs_dt", False):
+            S0 = runtime_model.source(ref, aux_ref, p, sim_time, dt, x_3d)
+        else:
+            S0 = runtime_model.source(ref, aux_ref, p, sim_time, x_3d)
         J = runtime_model.source_jacobian_wrt_variables(ref, aux_ref, p)
         Jdq = ufl.dot(J, dq)
         # Aux (hinv) chain-rule term  dS/dQaux · dQaux/dQ · dq: hinv = f(h) and
