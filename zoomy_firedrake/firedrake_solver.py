@@ -688,8 +688,12 @@ class FiredrakeHyperbolicSolver:
             F_face = (1.0 - theta_f) * F_hi + theta_f * F_lo
         else:
             F_face = F_hi
-        weak_form = fd.dot(test_q, (trial_q - Qn) / dt) * fd.dx
-        weak_form += fd.dot(test_q("+") - test_q("-"), F_face) * fd.dS
+        # ``spatial`` accumulates the whole spatial residual R(Qn) — every
+        # term EXCEPT the mass matrix.  It is multiplied through by ``dt`` at
+        # the very end so the mass term can stay ``dt``-free (= pure geometry
+        # M); see the return statement for why this preserves the solution
+        # exactly while making ``fd.lhs`` reusable across time steps.
+        spatial = fd.dot(test_q("+") - test_q("-"), F_face) * fd.dS
 
         nc_flux = self.get_nonconservative_flux(runtime_model, runtime_model.parameters, mesh)
         Dp, Dm = nc_flux(Q("-"), Q("+"), Qaux_n("-"), Qaux_n("+"), n("-"))
@@ -708,8 +712,8 @@ class FiredrakeHyperbolicSolver:
             Dp0, Dm0 = nc_flux(Q0("-"), Q0("+"), Qaux0("-"), Qaux0("+"), n("-"))
             Dp = (1.0 - theta_f) * Dp + theta_f * Dp0
             Dm = (1.0 - theta_f) * Dm + theta_f * Dm0
-        weak_form += fd.dot(test_q("+"), Dp) * fd.dS
-        weak_form += fd.dot(test_q("-"), Dm) * fd.dS
+        spatial += fd.dot(test_q("+"), Dp) * fd.dS
+        spatial += fd.dot(test_q("-"), Dm) * fd.dS
 
         for tag, idx in map_boundary_tag_to_function_index.items():
             # ``__all__`` is the sentinel emitted by
@@ -745,8 +749,8 @@ class FiredrakeHyperbolicSolver:
                     runtime_model.parameters, n, mesh)
                 Dp0_b, Dm0_b = nc_flux(Q0, Q0_bnd, Qaux0, Qaux0, n)
                 Dm_b = (1.0 - theta) * Dm_b + theta * Dm0_b
-            weak_form += ufl.dot(test_q, F_bnd) * ds_measure
-            weak_form += fd.dot(test_q, Dm_b) * ds_measure
+            spatial += ufl.dot(test_q, F_bnd) * ds_measure
+            spatial += fd.dot(test_q, Dm_b) * ds_measure
 
         # --- DG(1+) volume terms.  For dg_degree ≥ 1 the in-cell test
         # gradient is nonzero and the standard DG form needs, per cell,
@@ -769,14 +773,14 @@ class FiredrakeHyperbolicSolver:
             # switched off so the cell collapses to the cell-mean DG(0) update.
             vol_w = (1.0 - theta) if mood else 1.0
             for d in range(gdim):
-                weak_form -= vol_w * fd.dot(F_slabs[d], grad_v[:, d]) * fd.dx
+                spatial -= vol_w * fd.dot(F_slabs[d], grad_v[:, d]) * fd.dx
             ncp_nonzero = any(
                 e != 0 for e in sp.flatten(sm_vol.nonconservative_matrix))
             if ncp_nonzero:
                 B_slabs = self._build_ncp_slabs(
                     sm_vol, Q, Qaux, runtime_model)
                 for d in range(gdim):
-                    weak_form += vol_w * fd.dot(
+                    spatial += vol_w * fd.dot(
                         test_q, B_slabs[d] * grad_Q[:, d]) * fd.dx
 
         # --- Explicit IMEX slot: ``diffusion_matrix_explicit`` →
@@ -785,7 +789,7 @@ class FiredrakeHyperbolicSolver:
         # _get_weak_form_source).
         sm = self._state.system_model
         if self._slot_is_nonzero(sm, "diffusion_matrix_explicit"):
-            weak_form += self._get_weak_form_diffusion(
+            spatial += self._get_weak_form_diffusion(
                 runtime_model, Q, Qaux_n, test_q, mesh, n,
                 map_boundary_tag_to_function_index, sim_time, x, x_3d,
                 slot="diffusion_matrix_explicit",
@@ -797,8 +801,18 @@ class FiredrakeHyperbolicSolver:
         if self._slot_is_nonzero(sm, "source_explicit"):
             S_expl = runtime_model.source_explicit(
                 Q, Qaux_n, runtime_model.parameters)
-            weak_form -= fd.dot(test_q, S_expl) * fd.dx
+            spatial -= fd.dot(test_q, S_expl) * fd.dx
 
+        # Assemble ``M·(trial - Qn) + dt·R(Qn) = 0``.  This is the original
+        # residual ``M/dt·(trial - Qn) + R(Qn) = 0`` multiplied through by the
+        # scalar ``dt`` — an algebraically IDENTICAL linear system, but its
+        # ``lhs`` (the bilinear ``trial`` part) is now the pure geometry mass
+        # matrix ``M`` with NO ``dt`` dependence.  ``dt`` (a ``fd.Constant``
+        # bumped every step) lives entirely in the ``rhs`` now, so the
+        # assembled+factorized operator can be reused across time steps
+        # (``constant_jacobian=True`` in :meth:`_get_linear_solver`) and is
+        # rebuilt only when the mesh — hence ``M`` — changes on AMR.
+        weak_form = fd.dot(test_q, trial_q - Qn) * fd.dx + dt * spatial
         return weak_form
 
     def _get_weak_form_source(
@@ -1624,7 +1638,16 @@ class FiredrakeHyperbolicSolver:
     def _get_linear_solver(self, weak_form, Qnp1, Qaux_np1):
         a = fd.lhs(weak_form)
         L = fd.rhs(weak_form)
-        problem = fd.LinearVariationalProblem(a, L, Qnp1)
+        # ``a`` is the pure geometry mass matrix ``M`` (dt-free — see
+        # :meth:`_get_weak_form_convective`), so the operator is identical from
+        # step to step.  ``constant_jacobian=True`` assembles+factorizes it
+        # once and reuses it across every ``solve()``; only the ``rhs`` (which
+        # carries ``dt``, ``Qn``, the fluxes …) is re-assembled per step.  The
+        # AMR path rebuilds the solver from scratch on mesh adapt (a fresh
+        # ``LinearVariationalProblem`` on the new mesh's ``M``), so this reuse
+        # is invalidated exactly when the mesh changes.
+        problem = fd.LinearVariationalProblem(
+            a, L, Qnp1, constant_jacobian=True)
         sp_ = self.linear_solver_parameters or self.DEFAULT_LINEAR_SOLVER_PARAMETERS
         return fd.LinearVariationalSolver(problem, solver_parameters=dict(sp_))
 
