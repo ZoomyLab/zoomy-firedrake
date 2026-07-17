@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 
 import firedrake as fd
-from pyop2 import Kernel, parloop, READ, WRITE, RW
+from pyop2 import Kernel, parloop, READ, WRITE, RW, MIN, MAX
 
 __all__ = [
     "zhang_shu_positivity",
@@ -34,6 +34,7 @@ __all__ = [
     "copy_component_v2v",
     "cell_mean_finite_or_inf",
     "mood_troubled_indicator",
+    "FusedVertexLimiter",
 ]
 
 
@@ -155,6 +156,142 @@ def copy_component_v2v(dst: fd.Function, src: fd.Function, ci: int) -> None:
             V.mesh().cell_set,
             dst.dat(RW, V.cell_node_map()),
             src.dat(READ, src.function_space().cell_node_map()))
+
+
+# ---------------------------------------------------------------------------
+# Fused vector Kuzmin vertex-based limiter (replaces the per-component
+# ``for i: extract_component; VertexBasedLimiter.apply; copy_component`` loop
+# of ``_apply_slope_limiter``).
+#
+# Firedrake's :class:`~firedrake.VertexBasedLimiter` is scalar-only: limiting a
+# ``VectorFunctionSpace(dim=nc)`` state fires, PER component, an ``extract``
+# par_loop + an ``assemble`` + a mass ``solve`` (centroids) + two ``assign``s +
+# a min/max par_loop + a limit par_loop + a ``copy`` par_loop — ``O(nc)`` launch
+# floods where the arithmetic is a handful of flops per cell.
+#
+# This fuses the whole thing into **three cell-set par_loops + two assigns per
+# call, independent of ``nc``**, looping the components INSIDE each C kernel:
+#   1. ``_centroid_kernel``  — per-cell arithmetic mean of the DG1 nodal values
+#      → a ``VectorFunctionSpace(DG,0)`` centroid (all components at once).  On a
+#      P1 simplex the cell mean IS the vertex arithmetic mean, so this equals
+#      Firedrake's L2-projection centroid to a libm ULP (verified ≤1e-15).
+#   2. ``_minmax_kernel``    — scatter each cell centroid into the ``CG1`` vertex
+#      max/min bounds (``MIN``/``MAX`` reduction over cells sharing a vertex,
+#      halo-safe — the same reduction Firedrake's ``compute_bounds`` par_loop
+#      does, just batched over components).
+#   3. ``_limit_kernel``     — Kuzmin's per-vertex α and the mean-preserving
+#      ``qavg + α(q − qavg)`` rescale, for every ACTIVE (non-excluded) component;
+#      excluded components (e.g. bathymetry) are never written — bit-preserved.
+# The α recurrence transcribes Firedrake's loopy kernel branch-for-branch, so
+# the limited field matches the per-component path to roundoff (≤1e-15/cell).
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def _centroid_kernel(nq: int, nc: int) -> Kernel:
+    return Kernel(f"""
+void zoomy_centroid(double *cbar, const double *q) {{
+  const int nq = {nq}, nc = {nc};
+  for (int c = 0; c < nc; c++) {{
+    double s = 0.0;
+    for (int a = 0; a < nq; a++) s += q[a*nc + c];
+    cbar[c] = s / nq;
+  }}
+}}""", "zoomy_centroid", accesses=[WRITE, READ])
+
+
+@functools.lru_cache(maxsize=None)
+def _minmax_kernel(nq: int, nc: int) -> Kernel:
+    return Kernel(f"""
+void zoomy_minmax(double *maxq, double *minq, const double *cbar) {{
+  const int nq = {nq}, nc = {nc};
+  for (int a = 0; a < nq; a++)
+    for (int c = 0; c < nc; c++) {{
+      double v = cbar[c];
+      if (v > maxq[a*nc + c]) maxq[a*nc + c] = v;
+      if (v < minq[a*nc + c]) minq[a*nc + c] = v;
+    }}
+}}""", "zoomy_minmax", accesses=[MAX, MIN, READ])
+
+
+@functools.lru_cache(maxsize=None)
+def _limit_kernel(nq: int, nc: int, active: tuple) -> Kernel:
+    # One unrolled block per active component; the α recurrence mirrors
+    # Firedrake's ``_limit_kernel`` (fmin(alpha, fmin(1, ...)) on the same
+    # branch it selects), so the selected value is computed identically.
+    blocks = ""
+    for c in active:
+        blocks += f"""
+  {{
+    const int c = {c};
+    double qavg = cbar[c];
+    double alpha = 1.0;
+    for (int i = 0; i < nq; i++) {{
+      double qi = q[i*nc + c];
+      if (qi > qavg)
+        alpha = fmin(alpha, fmin(1.0, (qmax[i*nc + c] - qavg)/(qi - qavg)));
+      else if (qi < qavg)
+        alpha = fmin(alpha, fmin(1.0, (qavg - qmin[i*nc + c])/(qavg - qi)));
+    }}
+    for (int ii = 0; ii < nq; ii++)
+      q[ii*nc + c] = qavg + alpha*(q[ii*nc + c] - qavg);
+  }}"""
+    return Kernel(f"""
+void zoomy_limit(double *q, const double *cbar,
+                 const double *qmax, const double *qmin) {{
+  const int nq = {nq}, nc = {nc};{blocks}
+}}""", "zoomy_limit", accesses=[RW, READ, READ, READ])
+
+
+class FusedVertexLimiter:
+    """Kuzmin vertex-based slope limiter for a DG(1) ``VectorFunctionSpace``,
+    applied to all non-excluded components in three ``pyop2.parloop`` launches
+    (plus two ``assign``s) per call — independent of the component count.
+
+    A fused, halo-safe transcription of the per-component
+    :class:`firedrake.VertexBasedLimiter` loop it replaces; results match to
+    ~1e-15 per cell (arithmetic-mean vs L2-projection centroid, one libm ULP).
+    Scratch fields (DG0 centroids, CG1 vertex bounds) are allocated once and
+    reused; cache the instance per state (it binds to one function space).
+    """
+
+    def __init__(self, V: fd.FunctionSpace):
+        mesh = V.mesh()
+        self.V = V
+        self.nc = V.value_size
+        self.nq = V.cell_node_map().arity
+        self.P0 = fd.VectorFunctionSpace(mesh, "DG", 0, dim=self.nc)
+        self.P1CG = fd.VectorFunctionSpace(mesh, "CG", 1, dim=self.nc)
+        self.centroids = fd.Function(self.P0)
+        self.max_field = fd.Function(self.P1CG)
+        self.min_field = fd.Function(self.P1CG)
+
+    def apply(self, W: fd.Function, exclude=frozenset()) -> None:
+        """Limit every component of ``W`` except those in ``exclude`` in place."""
+        active = tuple(c for c in range(self.nc) if c not in exclude)
+        if not active:
+            return
+        cs = self.V.mesh().cell_set
+        cnm = self.V.cell_node_map()
+        cnm0 = self.P0.cell_node_map()
+        cnm1 = self.P1CG.cell_node_map()
+
+        # 1. cell centroids (all components) via a single arithmetic-mean pass.
+        parloop(_centroid_kernel(self.nq, self.nc), cs,
+                self.centroids.dat(WRITE, cnm0), W.dat(READ, cnm))
+
+        # 2. vertex min/max bounds over neighbouring cells (MIN/MAX reduction).
+        self.max_field.assign(-1.0e10)
+        self.min_field.assign(1.0e10)
+        parloop(_minmax_kernel(self.nq, self.nc), cs,
+                self.max_field.dat(MAX, cnm1),
+                self.min_field.dat(MIN, cnm1),
+                self.centroids.dat(READ, cnm0))
+
+        # 3. Kuzmin α-clip + mean-preserving rescale of the active components.
+        parloop(_limit_kernel(self.nq, self.nc, active), cs,
+                W.dat(RW, cnm),
+                self.centroids.dat(READ, cnm0),
+                self.max_field.dat(READ, cnm1),
+                self.min_field.dat(READ, cnm1))
 
 
 # ---------------------------------------------------------------------------

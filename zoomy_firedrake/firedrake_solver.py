@@ -13,6 +13,7 @@ from zoomy_core.fvm.riemann_solvers import Rusanov
 from zoomy_firedrake.limiter_kernels import (
     zhang_shu_positivity, extract_component, copy_component,
     copy_component_v2v, cell_mean_finite_or_inf, mood_troubled_indicator,
+    FusedVertexLimiter,
 )
 from zoomy_firedrake.eigensolve import NumericalEigenSpectrum
 import numpy as np
@@ -1495,41 +1496,51 @@ class FiredrakeHyperbolicSolver:
         V = W.function_space()
         mesh = V.mesh()
         ncomp = V.value_size
-
-        # Build a scalar DG space with the same degree for the limiter
-        V_scalar = fd.FunctionSpace(mesh, "DG", self.dg_degree)
-
-        if self.limiter == "p_weighted":
-            from zoomy_firedrake.p_weighted_limiter import PWeightedLimiter
-            # Cache the limiter on _state to avoid recomputing adjacency
-            s = self._state
-            if s is not None and hasattr(s, "_pw_limiter"):
-                limiter = s._pw_limiter
-            else:
-                limiter = PWeightedLimiter(V_scalar)
-                if s is not None:
-                    s._pw_limiter = limiter
-        else:
-            limiter = fd.VertexBasedLimiter(V_scalar)
-
         exclude = getattr(self._state, "limiter_exclude_indices",
                           frozenset())
 
-        # Per-component limiting via **compiled per-cell component copies**
+        if self.limiter != "p_weighted":
+            # Kuzmin vertex-based limiter (the default): FUSED over all
+            # components into three ``pyop2.parloop`` launches + two assigns per
+            # call, independent of ``ncomp`` — see
+            # :class:`zoomy_firedrake.limiter_kernels.FusedVertexLimiter`.  This
+            # replaces the per-component ``extract_component →
+            # VertexBasedLimiter.apply → copy_component`` loop, whose
+            # ``VertexBasedLimiter.apply`` fired an assemble + a mass solve +
+            # two assigns + two par_loops PER component (~8·ncomp launches).
+            # Excluded components (e.g. bathymetry ``b``) are never written —
+            # bit-preserved.  Cached on ``_state`` (binds to one space; the
+            # cache is naturally dropped when the mesh adapts and ``_state`` is
+            # rebuilt).  Output matches the per-component path to ~1e-15/cell
+            # (arithmetic-mean vs L2-projection centroid — one libm ULP).
+            s = self._state
+            fl = getattr(s, "_fused_vertex_limiter", None)
+            if fl is None or fl.V is not V:
+                fl = FusedVertexLimiter(V)
+                if s is not None:
+                    s._fused_vertex_limiter = fl
+            fl.apply(W, exclude)
+            self._reconstruct_out(Q, W, recon_aux)
+            self._apply_positivity_scaling(Q)
+            return
+
+        # p_weighted: :class:`PWeightedLimiter` (Li et al. 2020, per-mode
+        # damping) is a scalar-space algorithm, so it stays on the
+        # per-component compiled-copy path
         # (:func:`zoomy_firedrake.limiter_kernels.extract_component` /
-        # ``copy_component`` — a ``pyop2.parloop`` over the cell-node map).
-        # Excluded components (e.g. bathymetry ``b``) are never touched —
-        # bit-preserved.  These kernels replace the earlier ``.dat.data``
-        # numpy slices: the slice write bypassed PyOP2's halo dirty-tracking
-        # (the root of the ``VectorFunctionSpace.sub(i)`` corruption + the
-        # ``Q.interpolate(fd.as_vector(...))`` ~1% mass injection those slices
-        # were introduced to dodge), whereas a par_loop declares its access
-        # (WRITE/RW/READ) so halos stay consistent — the root-cause fix, not a
-        # bypass.  The exact per-node component copy leaves Kuzmin's
-        # cell-average-preserving output bit-for-bit intact.
-        #
-        # **Phase ordering** (all reads before all writes) is kept: it is
-        # harmless with the compiled copies and documents the data flow.
+        # ``copy_component`` — a ``pyop2.parloop`` over the cell-node map, which
+        # keeps PyOP2's halo dirty-tracking that a raw ``.dat.data`` slice would
+        # bypass).  Excluded components are never touched — bit-preserved.
+        V_scalar = fd.FunctionSpace(mesh, "DG", self.dg_degree)
+        from zoomy_firedrake.p_weighted_limiter import PWeightedLimiter
+        s = self._state
+        if s is not None and hasattr(s, "_pw_limiter"):
+            limiter = s._pw_limiter
+        else:
+            limiter = PWeightedLimiter(V_scalar)
+            if s is not None:
+                s._pw_limiter = limiter
+
         limited = {}
         for i in range(ncomp):
             if i in exclude:
