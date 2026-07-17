@@ -22,6 +22,7 @@ from pyop2 import op2
 from firedrake_animate.utility import VTKFile
 from firedrake_animate.metric import RiemannianMetric, P0Metric
 from firedrake_animate.adapt import adapt
+from firedrake_animate.recovery import recover_gradient_l2
 
 from firedrake.projection import Projector
 from firedrake.petsc import PETSc
@@ -59,6 +60,15 @@ def grow_indicator(ind_dg0: fd.Function, width: int = 1) -> fd.Function:
 class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
     refine_every: int = field(default=20)      # time steps between refinements
     enable_amr: bool = field(default=True)    # total refinement steps
+    # AMR sizing mode:
+    #   "complexity" — fixed budget: normalise the metric to a target vertex
+    #                  count, so the cell count stays roughly constant.
+    #   "grad_h"     — absolute, budget-free: element size is set directly from
+    #                  |grad h| (fine near steep h, coarse where smooth); the
+    #                  cell count is emergent, bounded only by [amr_h_min, amr_h_max].
+    amr_metric: str = field(default="complexity")
+    amr_h_min: float = field(default=0.05)     # grad_h mode: finest element size
+    amr_h_max: float = field(default=2.0)      # grad_h mode: coarsest element size
 
     # ------------------------------------------------------------------
     # Metric helpers based on RiemannianMetric
@@ -144,6 +154,57 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
 
         metric = RiemannianMetric(mesh, name="bathymetry_metric")
         metric.compute_isotropic_metric(weight, interpolant="L2")
+        metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
+        return metric
+
+    def _metric_grad_h(self, Q, grad_ref=None, L_ref=None, L_bkg=None):
+        """Absolute, budget-free refinement metric from ``|grad h|``.
+
+        The desired element size transitions continuously from ``L_bkg`` (coarse,
+        smooth flow) to ``L_ref`` (fine, steep h), with the fine fraction set by
+        ``|grad h| / grad_ref``.  The metric is NOT normalised to a target
+        complexity, so the cell count is emergent — mmg refines where detail is
+        needed and coarsens elsewhere — bounded only by the [L_ref, L_bkg] size
+        limits (``restrict_sizes``).  ``grad_ref`` defaults to the current global
+        max ``|grad h|`` (MPI-safe), so the transition tracks the running shock.
+        """
+        mesh = Q.function_space().mesh()
+        L_ref = self.amr_h_min if L_ref is None else L_ref
+        L_bkg = self.amr_h_max if L_bkg is None else L_bkg
+        Vcg1 = fd.FunctionSpace(mesh, "CG", 1)
+        # GRADIENT CAPTURE.  ``fd.interpolate(expr, V)`` returns a *symbolic*
+        # ``Interpolate`` (BaseFormOperator), not a Function; its UFL ``grad`` is
+        # identically zero (grad of the opaque operator, NOT of the interpolant),
+        # so the old ``grad(fd.interpolate(...))`` gave |grad h| == 1e-15 and every
+        # cell coarsened to ``h_max``.  Fix: materialise h as a real CG1 Function,
+        # then recover ``grad h`` by L2 projection (recovery.py) — a DG0 shock's
+        # cell jumps then produce a genuine, front-localised |grad h|.
+        h_cg = fd.Function(Vcg1).interpolate(Q.sub(1))
+        grad_h = recover_gradient_l2(
+            h_cg, target_space=fd.VectorFunctionSpace(mesh, "CG", 1))
+        gnorm = fd.Function(Vcg1)
+        gnorm.interpolate(fd.sqrt(fd.inner(grad_h, grad_h) + 1.0e-30))
+        if grad_ref is None:
+            with gnorm.dat.vec_ro as v:
+                grad_ref = max(v.max()[1], 1.0e-12)      # global max, collective
+        # continuous fine-fraction in [0, 1]; 1 where |grad h| >= grad_ref
+        frac = fd.Function(Vcg1)
+        frac.interpolate(ufl.min_value(1.0, gnorm / fd.Constant(grad_ref)))
+        L = fd.Function(Vcg1)
+        L.interpolate(L_bkg - frac * (L_bkg - L_ref))    # L_ref (fine) at steep h
+        weight = fd.Function(Vcg1)
+        weight.interpolate(1.0 / (L * L + 1.0e-12))      # metric eigenvalue = 1/L^2
+        # Build the metric DIRECTLY as M = (1/L^2) I (an ABSOLUTE size metric —
+        # edge length = 1/sqrt(eigenvalue) = L), NOT via compute_isotropic_metric,
+        # which yields an error indicator that must be normalise()'d to a budget.
+        # Here we skip normalise so the size is taken literally.
+        dim = mesh.geometric_dimension
+        metric = RiemannianMetric(mesh, name="grad_h_metric")
+        metric.interpolate(weight * fd.Identity(dim))
+        metric.set_parameters({
+            "dm_plex_metric_h_min": L_ref,
+            "dm_plex_metric_h_max": L_bkg,
+        })
         metric.enforce_spd(restrict_anisotropy=True, restrict_sizes=True)
         return metric
     
@@ -391,13 +452,18 @@ class FiredrakeHyperbolicSolverAMR(fd_solver.FiredrakeHyperbolicSolver):
                 logger.info(f"Refining at iteration {int(iteration)}")
                 old_num_cells = s.mesh.num_cells()
                 try:
-                    metric, _ = self._metric_wet_dry_smooth(
-                        s.Qnp1, gamma=10000, width=1)
-                    metric.set_parameters({
-                        "dm_plex_metric_target_complexity": mesh_complexity,
-                        "dm_plex_metric_p": np.inf,
-                    })
-                    metric.normalise()
+                    if self.amr_metric == "grad_h":
+                        # Absolute, budget-free: size straight from |grad h|,
+                        # NO normalise / target complexity -> emergent cell count.
+                        metric = self._metric_grad_h(s.Qnp1)
+                    else:
+                        metric, _ = self._metric_wet_dry_smooth(
+                            s.Qnp1, gamma=10000, width=1)
+                        metric.set_parameters({
+                            "dm_plex_metric_target_complexity": mesh_complexity,
+                            "dm_plex_metric_p": np.inf,
+                        })
+                        metric.normalise()
                     new_mesh = adapt(s.mesh, metric)
 
                     # Prolong the current solution into the new-mesh spaces
