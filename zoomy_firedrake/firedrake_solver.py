@@ -549,6 +549,14 @@ class FiredrakeHyperbolicSolver:
 
         degree_factor = float(2 * degree + 1)
         dim_factor = float(dim)
+        # REQ-190: the standard NSM timestep cap.  ``model`` is the
+        # UFLRuntimeModel (a NumpyRuntimeModel), which carries the NSM's
+        # ``dt_max`` (default 5.0 s) emitted uniformly across backends.  A
+        # WAVE-FREE (fully-dry) domain makes ``lam ≈ 0`` everywhere, so
+        # ``dt_expr = CFL·h/(… + 1e-8)`` blows up to a huge finite value — the
+        # cap then returns ``dt_max`` (never inf, never a magic floor), matching
+        # the numpy/jax ``timestepping.adaptive`` wave-free behaviour.
+        dt_max = float(getattr(model, "dt_max", 5.0))
 
         # Sample the per-point CFL bound at every nodal DOF of a
         # ``DG(degree)`` scalar space (i.e. one DOF per Q-DOF in each
@@ -611,7 +619,9 @@ class FiredrakeHyperbolicSolver:
             # ``Vec.min`` does the allreduce internally, so every rank agrees;
             # no numpy on ``.dat.data``, no manual MPI reduce).
             with dt_local.dat.vec_ro as v:
-                return float(v.min()[1])
+                # REQ-190: clamp to the NSM ``dt_max`` — a wave-free domain
+                # (``lam ≈ 0`` everywhere) otherwise returns a huge uncapped dt.
+                return min(float(v.min()[1]), dt_max)
 
         return compute_dt
 
